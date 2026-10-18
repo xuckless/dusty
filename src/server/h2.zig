@@ -205,6 +205,13 @@ pub fn Engine(comptime Ctx: type) type {
             /// Counted in the server's in-flight requests (by `startStream`)
             /// until it is freed.
             counted: bool = false,
+            /// The frame that ends the response went out.
+            response_sent: bool = false,
+            /// The handler is done and the response is out, but the peer is
+            /// still sending a body: what arrives is consumed and dropped,
+            /// up to `discard_left` bytes, then the stream is reset.
+            discarding: bool = false,
+            discard_left: usize = 0,
 
             const Field = struct { name: []const u8, value: []const u8 };
 
@@ -431,6 +438,7 @@ pub fn Engine(comptime Ctx: type) type {
             defer {
                 conn.lock();
                 defer conn.unlock();
+                if (stream.response_sent and !stream.body_done and !stream.reset) startDiscard(conn, stream);
                 stream.release(.handler);
                 conn.kickWriter();
             }
@@ -953,21 +961,42 @@ pub fn Engine(comptime Ctx: type) type {
             };
         }
 
-        /// Once the frame that ends a response is out, a request body the
-        /// handler left unread is not waited for: the stream ends with
-        /// RST_STREAM(NO_ERROR) (RFC 9113 §8.1). Sent here rather than when
-        /// the handler returns, since nghttp2 sends RST_STREAM ahead of a
-        /// response still queued, which would cut it off.
+        /// Notes when the frame that ends a response is out. If the handler
+        /// is done and the request body is still coming, the rest of it is
+        /// discarded (`startDiscard`). Done here rather than when the handler
+        /// returns, since nghttp2 sends RST_STREAM ahead of a response still
+        /// queued, which would cut it off.
         fn onFrameSend(session: ?*c.nghttp2_session, frame: [*c]const c.nghttp2_frame, user_data: ?*anyopaque) callconv(.c) c_int {
-            _ = user_data;
+            const conn = connFrom(user_data);
             const hd = frame.*.hd;
             if (hd.flags & c.NGHTTP2_FLAG_END_STREAM == 0) return 0;
             if (hd.type != c.NGHTTP2_HEADERS and hd.type != c.NGHTTP2_DATA) return 0;
             const stream = streamFor(session, hd.stream_id) orelse return 0;
-            if (!stream.body_done and !stream.reset) {
-                _ = c.nghttp2_submit_rst_stream(session, c.NGHTTP2_FLAG_NONE, hd.stream_id, c.NGHTTP2_NO_ERROR);
-            }
+            stream.response_sent = true;
+            if (stream.handler_done and !stream.body_done and !stream.reset) startDiscard(conn, stream);
             return 0;
+        }
+
+        /// The response is complete and nobody will read the rest of the
+        /// request body. Like dusty's HTTP/1.x drain, a little more of it is
+        /// read and dropped, so a peer still sending a small body sees a
+        /// clean end and its later frames are still checked; past one stream
+        /// window the stream ends with RST_STREAM(NO_ERROR) (RFC 9113 §8.1).
+        /// Under the mutex.
+        fn startDiscard(conn: *Conn, stream: *Stream) void {
+            if (stream.discarding) return;
+            stream.discarding = true;
+            stream.discard_left = conn.config.stream_window;
+            // What is queued was never credited back: credit it now.
+            if (stream.body) |*q| {
+                var scratch: [4096]u8 = undefined;
+                while (true) {
+                    const n = q.getUncancelable(conn.io, &scratch, 0) catch break;
+                    if (n == 0) break;
+                    _ = c.nghttp2_session_consume(conn.session, stream.id, n);
+                }
+            }
+            conn.kickWriter();
         }
 
         fn onDataChunk(
@@ -982,6 +1011,14 @@ pub fn Engine(comptime Ctx: type) type {
             const conn = connFrom(user_data);
             const stream = streamFor(session, stream_id) orelse return 0;
             if (stream.body_done) return 0;
+            if (stream.discarding) {
+                _ = c.nghttp2_session_consume(session, stream_id, len);
+                if (len >= stream.discard_left) {
+                    stream.discard_left = 0;
+                    _ = c.nghttp2_submit_rst_stream(session, c.NGHTTP2_FLAG_NONE, stream_id, c.NGHTTP2_NO_ERROR);
+                } else stream.discard_left -= len;
+                return 0;
+            }
             if (stream.body == null) {
                 const buf = stream.arena.allocator().alloc(u8, conn.config.stream_window) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
                 stream.body = .init(buf);

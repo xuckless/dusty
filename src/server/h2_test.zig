@@ -325,6 +325,26 @@ test "HTTP/2: trailers follow the body" {
     try std.testing.expectEqualStrings("yes", client.get(id).trailer.?);
 }
 
+test "HTTP/2: a small unread request body is read and dropped, and the stream ends cleanly" {
+    const io = std.testing.io;
+    var fx: Fixture = undefined;
+    try fx.start(io);
+    defer fx.stop(io);
+
+    const body = try std.testing.allocator.alloc(u8, 20 * 1024);
+    defer std.testing.allocator.free(body);
+    @memset(body, 'y');
+
+    var client: TestClient = undefined;
+    try client.init(std.testing.allocator, io, fx.server.address.ip);
+    defer client.deinit();
+    const id = try client.request("POST", "/ignore", body);
+    try client.run();
+    try std.testing.expectEqual(@as(u16, 200), client.get(id).status);
+    try std.testing.expectEqualStrings("not reading that", client.get(id).body.items);
+    try std.testing.expectEqual(@as(u32, c.NGHTTP2_NO_ERROR), client.get(id).error_code);
+}
+
 test "HTTP/2: an unread request body gets the whole response, then RST_STREAM(NO_ERROR)" {
     const io = std.testing.io;
     var fx: Fixture = undefined;
