@@ -29,7 +29,7 @@ fn send(server: *dusty.Server(void), request: []const u8, out: []u8) ![]const u8
     }.run, .{server});
     defer server_future.cancel(io) catch {};
 
-    try server.ready.wait(io);
+    try server.waitReady(io);
     const stream = try server.address.ip.connect(io, .{ .mode = .stream });
     defer stream.close(io);
 

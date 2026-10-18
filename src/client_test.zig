@@ -25,7 +25,7 @@ test "Client: simple GET request" {
 
     var client_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void), _io: std.Io) !void {
-            try s.ready.wait(_io);
+            try s.waitReady(_io);
 
             const port = s.address.ip.getPort();
 
@@ -73,7 +73,7 @@ test "Client: fetch GET request" {
 
     var client_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void), _io: std.Io) !void {
-            try s.ready.wait(_io);
+            try s.waitReady(_io);
 
             const port = s.address.ip.getPort();
 
@@ -124,7 +124,7 @@ test "Client: connection pooling" {
 
     var client_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void), _io: std.Io) !void {
-            try s.ready.wait(_io);
+            try s.waitReady(_io);
 
             const port = s.address.ip.getPort();
 
@@ -186,7 +186,7 @@ test "Client: pool evicts dead connection after server goes away" {
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
 
-    try server.ready.wait(io);
+    try server.waitReady(io);
 
     const port = server.address.ip.getPort();
     var url_buf: [64]u8 = undefined;
@@ -272,7 +272,7 @@ test "Client: redirect failing after connection release does not double-release"
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
 
-    try server.ready.wait(io);
+    try server.waitReady(io);
 
     const port = server.address.ip.getPort();
     var url_buf: [64]u8 = undefined;
@@ -327,7 +327,7 @@ test "Client: a connection with an unread response body is drained and reused" {
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
 
-    try server.ready.wait(io);
+    try server.waitReady(io);
 
     const port = server.address.ip.getPort();
     var url_buf: [64]u8 = undefined;
@@ -412,7 +412,7 @@ test "Client: pool survives concurrent fetches on a shared client" {
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
 
-    try server.ready.wait(io);
+    try server.waitReady(io);
 
     const port = server.address.ip.getPort();
     var url_buf: [64]u8 = undefined;
@@ -506,7 +506,7 @@ test "Client: WebSocket upgrade" {
 
     var client_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void), _io: std.Io) !void {
-            try s.ready.wait(_io);
+            try s.waitReady(_io);
 
             const port = s.address.ip.getPort();
 
@@ -645,7 +645,7 @@ test "Client: one server serves a plain listener and a TLS listener" {
 
     var client_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void), _io: std.Io) !void {
-            try s.ready.wait(_io);
+            try s.waitReady(_io);
 
             var client = dusty.Client.init(std.testing.allocator, _io, .{
                 .tls = .{ .ca = .{ .file = .{ .path = test_cert_path } } },
@@ -695,7 +695,7 @@ test "Client: HTTPS with a custom CA file" {
 
     var client_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void), _io: std.Io) !void {
-            try s.ready.wait(_io);
+            try s.waitReady(_io);
 
             var client = dusty.Client.init(std.testing.allocator, _io, .{
                 .tls = .{ .ca = .{ .file = .{ .path = test_cert_path } } },
@@ -748,7 +748,7 @@ test "Client: HTTPS to a listener whose certificate is PEM in memory" {
 
     var client_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void), _io: std.Io) !void {
-            try s.ready.wait(_io);
+            try s.waitReady(_io);
 
             var client = dusty.Client.init(std.testing.allocator, _io, .{
                 .tls = .{ .ca = .{ .file = .{ .path = test_cert_path } } },
@@ -897,7 +897,7 @@ test "Server: tls.alpn_protocols is offered to the client through ALPN" {
 
     var client_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void), _io: std.Io) !void {
-            try s.ready.wait(_io);
+            try s.waitReady(_io);
             const ca: dusty.TlsCa = .{ .file = .{ .path = test_cert_path } };
             var bundle = try ca.load(std.testing.allocator, _io);
             defer bundle.deinit(std.testing.allocator);
@@ -956,7 +956,7 @@ test "Client: presents a client certificate for mutual TLS" {
 
     var client_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void), _io: std.Io) !void {
-            try s.ready.wait(_io);
+            try s.waitReady(_io);
             var url_buf: [64]u8 = undefined;
             const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/", .{s.address.ip.getPort()});
 
@@ -1094,7 +1094,7 @@ test "Server: client_auth .require rejects a client with no certificate" {
 
     var client_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void), _io: std.Io) !void {
-            try s.ready.wait(_io);
+            try s.waitReady(_io);
             var url_buf: [64]u8 = undefined;
             const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/", .{s.address.ip.getPort()});
 
@@ -1143,7 +1143,7 @@ test "Server: client_auth .request accepts a client with no certificate" {
 
     var client_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void), _io: std.Io) !void {
-            try s.ready.wait(_io);
+            try s.waitReady(_io);
             var url_buf: [64]u8 = undefined;
             const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/", .{s.address.ip.getPort()});
 
@@ -1187,7 +1187,7 @@ test "Client: rejects a server certificate the configured CA does not cover" {
 
     var client_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void), _io: std.Io) !void {
-            try s.ready.wait(_io);
+            try s.waitReady(_io);
             const port = s.address.ip.getPort();
             var url_buf: [64]u8 = undefined;
             const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/", .{port});
@@ -1882,7 +1882,7 @@ test "Client: FetchOptions.timeout replaces the client default" {
             }
         }.run, .{&server});
         defer server_future.cancel(io) catch {};
-        try server.ready.wait(io);
+        try server.waitReady(io);
 
         var client = dusty.Client.init(std.testing.allocator, io, .{ .timeout = .fromMilliseconds(100) });
         defer client.deinit();
@@ -1954,7 +1954,7 @@ test "Client: redirects share the request's budget" {
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
-    try server.ready.wait(io);
+    try server.waitReady(io);
 
     var url_buf: [64]u8 = undefined;
     const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/first", .{server.address.ip.getPort()});
@@ -2070,7 +2070,7 @@ test "Server: res.compress gzips buffered and streamed bodies for a client that 
         }
 
         fn run(s: *dusty.Server(void), _io: std.Io) !void {
-            try s.ready.wait(_io);
+            try s.waitReady(_io);
             const port = s.address.ip.getPort();
 
             var client = dusty.Client.init(std.testing.allocator, _io, .{});

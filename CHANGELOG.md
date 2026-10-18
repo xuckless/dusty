@@ -4,6 +4,28 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Added `Server.waitReady(io)`, which returns once `run` is listening, or
+  with `run`'s error (also in `Server.start_error`) once it has stopped
+  without getting there: a certificate that will not load, a port in use.
+  Waiting on `Server.ready`, which still means only "listening", waits for
+  good after such a failure.
+- A malformed request head (anything llhttp refuses, or a connection that
+  ends inside one) is now logged at info instead of err, as a failed TLS
+  handshake is: any peer can send one at will.
+- An HTTP/2 connection whose peer hangs up in the middle of a request's
+  header block now closes. The writer took the half-received stream for one
+  whose handler was still running, and waited for it for good.
+- The accept loop keeps a cancel pending across spawning a connection's
+  task. Under `std.Io.Threaded` with a Debug allocator, the stack trace the
+  allocator captures could swallow the cancel (Zig 0.17's unwinder takes a
+  cancelable lock), and the next `accept` then blocked the shutdown for good.
+- llhttp and the vendored nghttp2 are now static libraries the module links,
+  not C sources inside it, so the module can be built for Zig's fuzzer.
+  `zig build fuzz` runs the fuzz targets under Zig's own test runner, and
+  `zig build fuzz --fuzz=N` fuzzes them: the PROXY protocol parser and
+  reader, a request through llhttp delivered whole and a few bytes at a
+  time, and a whole connection's bytes (HTTP/1.1, or HTTP/2 with
+  `-Duse_http2=true`).
 - An HTTP/2 server engine on nghttp2, with the `use_http2` build option. A TLS
   listener serves HTTP/2 when `tls.alpn_protocols` offers "h2" and the client
   picks it; a cleartext listener with `http2_prior_knowledge` serves HTTP/2 to
