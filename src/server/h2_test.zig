@@ -419,3 +419,60 @@ test "HTTP/2: over TLS, chosen through ALPN" {
     try std.testing.expectEqualStrings("hello", client.get(hello).body.items);
     try std.testing.expect(std.mem.eql(u8, body, client.get(echoed).body.items));
 }
+
+/// Counts allocations through it, for the hot-path test below.
+const CountingAllocator = struct {
+    inner: std.mem.Allocator,
+    count: std.atomic.Value(usize) = .init(0),
+
+    fn allocator(self: *CountingAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        _ = self.count.fetchAdd(1, .monotonic);
+        return self.inner.rawAlloc(len, alignment, ra);
+    }
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        return self.inner.rawResize(memory, alignment, new_len, ra);
+    }
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        _ = self.count.fetchAdd(1, .monotonic);
+        return self.inner.rawRemap(memory, alignment, new_len, ra);
+    }
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        self.inner.rawFree(memory, alignment, ra);
+    }
+};
+
+test "HTTP/2: a warm connection serves requests without allocating" {
+    const io = std.testing.io;
+    var counting: CountingAllocator = .{ .inner = std.testing.allocator };
+    var server = dusty.Server(void).init(counting.allocator(), io, .{
+        .listeners = &.{.{ .address = loopback_addr, .http2_prior_knowledge = true }},
+    }, {});
+    defer server.deinit();
+    server.router.get("/users/:id", Handlers.user);
+    var future = try io.concurrent(Fixture.run, .{&server});
+    defer future.cancel(io) catch {};
+    try server.ready.wait(io);
+
+    var client: TestClient = undefined;
+    try client.init(std.testing.allocator, io, server.address.ip);
+    defer client.deinit();
+    // Warm up: the stream pool, arenas and maps grow to what a request needs.
+    for (0..5) |_| {
+        _ = try client.request("GET", "/users/1", null);
+        try client.run();
+    }
+    const before = counting.count.load(.monotonic);
+    for (0..20) |_| {
+        const id = try client.request("GET", "/users/2", null);
+        try client.run();
+        try std.testing.expectEqualStrings("user 2", client.get(id).body.items);
+    }
+    try std.testing.expectEqual(before, counting.count.load(.monotonic));
+}
