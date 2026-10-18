@@ -76,6 +76,9 @@ pub fn Router(comptime Ctx: type) type {
         any_tree: ?*Node = null,
         // Global middlewares applied to all routes
         middlewares: []const Middleware(Ctx) = &.{},
+        /// A route was registered: each route took a copy of the global
+        /// middleware then, so adding more now would miss them.
+        has_routes: bool = false,
 
         pub fn init(allocator: std.mem.Allocator) Self {
             return .{
@@ -152,6 +155,7 @@ pub fn Router(comptime Ctx: type) type {
             middlewares: []const Middleware(Ctx),
             data: ?*const anyopaque,
         ) !void {
+            self.has_routes = true;
             if (self.findConflict(path, method)) |c| {
                 std.debug.panic("route {s} {s} conflicts with any() route {s}: both match some paths, but {s} is not more specific", .{ c.method.name(), c.method_path, c.any_path, c.method_path });
             }
@@ -446,6 +450,18 @@ pub fn Router(comptime Ctx: type) type {
             return .{ .router = self, .prefix = prefix, .middlewares = middlewares };
         }
 
+        /// Adds a global middleware, run before every route's own, in the
+        /// order added. Routes take the global middleware when they are
+        /// registered, so this must come first: it panics once a route
+        /// exists, rather than leave earlier routes without it.
+        pub fn use(self: *Self, middleware: Middleware(Ctx)) void {
+            if (self.has_routes) @panic("router.use() after a route was registered: add middleware first");
+            const list = self.arena.allocator().alloc(Middleware(Ctx), self.middlewares.len + 1) catch @panic("OOM");
+            @memcpy(list[0..self.middlewares.len], self.middlewares);
+            list[self.middlewares.len] = middleware;
+            self.middlewares = list;
+        }
+
         pub const Group = struct {
             router: *Self,
             prefix: []const u8,
@@ -458,6 +474,16 @@ pub fn Router(comptime Ctx: type) type {
                 @memcpy(merged[0..g.router.middlewares.len], g.router.middlewares);
                 @memcpy(merged[g.router.middlewares.len..], g.middlewares);
                 return merged;
+            }
+
+            /// A group inside this one: its prefix after this one's, its
+            /// middleware after this one's.
+            pub fn group(g: Group, prefix: []const u8, middlewares: []const Middleware(Ctx)) Group {
+                const alloc = g.router.arena.allocator();
+                const merged = alloc.alloc(Middleware(Ctx), g.middlewares.len + middlewares.len) catch @panic("OOM");
+                @memcpy(merged[0..g.middlewares.len], g.middlewares);
+                @memcpy(merged[g.middlewares.len..], middlewares);
+                return .{ .router = g.router, .prefix = g.concatPath(prefix), .middlewares = merged };
             }
 
             fn concatPath(g: Group, path: []const u8) []const u8 {

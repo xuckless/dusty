@@ -52,6 +52,9 @@ pub const Request = struct {
     listener: *const Listener = &placeholder_listener,
     /// Whether the connection is TLS.
     secure: bool = false,
+    /// This request's ID, set by the RequestId middleware: for log lines,
+    /// traces and error reports. Empty without it.
+    id: []const u8 = "",
 
     arena: std.mem.Allocator,
     io: std.Io = undefined,
