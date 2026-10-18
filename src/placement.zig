@@ -10,6 +10,9 @@
 //! Elsewhere -- dusty's zio stub, a zio without placement, `std.Io.Threaded`,
 //! or zio's work-stealing scheduling, where pinning a task is invalid -- this
 //! is plain `concurrent`.
+//!
+//! It also lets one task cancel another single task of a group (`Task`),
+//! which `std.Io` has no call for: groups are canceled as a whole.
 const std = @import("std");
 const zio = @import("zio");
 
@@ -58,4 +61,37 @@ pub fn executorCount(io: std.Io) ?usize {
     if (comptime !have_zio) return null;
     const rt = zio.Runtime.fromIo(io) orelse return null;
     return rt.executors.items.len;
+}
+
+/// zio can cancel one task: the type behind the task an `AutoCancel` arms
+/// against has a non-blocking `cancel`.
+const have_task_cancel = !@hasDecl(zio, "is_stub") and @hasDecl(zio, "Runtime") and
+    @hasDecl(zio.Runtime, "fromIo") and @hasDecl(zio, "AutoCancel") and
+    @hasField(zio.AutoCancel, "task") and
+    @hasDecl(@typeInfo(@typeInfo(@FieldType(zio.AutoCancel, "task")).optional.child).pointer.child, "cancel");
+
+/// A running task that another task can cancel by itself, without its
+/// group. Void where that is not possible (not zio): `currentTask` returns
+/// null.
+pub const Task = if (have_task_cancel) @typeInfo(@FieldType(zio.AutoCancel, "task")).optional.child else void;
+
+/// The calling task, or null when it cannot be canceled alone. The handle
+/// is valid while the task runs: whoever cancels it must know it has not
+/// returned yet (in practice, under a lock the task takes before it ends).
+pub fn currentTask(io: std.Io) ?Task {
+    if (comptime !have_task_cancel) return null;
+    if (zio.Runtime.fromIo(io) == null) return null;
+    // zio has no public "current task", but an armed `AutoCancel` records
+    // the task it will cancel. Armed far out and cleared at once: the timer
+    // never fires.
+    var probe: zio.AutoCancel = .init;
+    probe.set(.fromSeconds(365 * 24 * 3600));
+    defer probe.clear();
+    return probe.task;
+}
+
+/// Asks `task` to stop: its next cancelable wait (or the one it is in)
+/// returns `error.Canceled`. Does not wait for it; safe from any thread.
+pub fn cancelTask(task: Task) void {
+    if (comptime have_task_cancel) task.cancel();
 }
