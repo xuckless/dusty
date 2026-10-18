@@ -271,8 +271,10 @@ pub fn Engine(comptime Ctx: type) type {
                     .{ .settings_id = c.NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, .value = conn.config.max_concurrent_streams },
                     .{ .settings_id = c.NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE, .value = conn.config.stream_window },
                     .{ .settings_id = c.NGHTTP2_SETTINGS_MAX_HEADER_LIST_SIZE, .value = conn.config.max_header_list_size },
+                    .{ .settings_id = c.NGHTTP2_SETTINGS_ENABLE_CONNECT_PROTOCOL, .value = 1 },
                 };
-                if (c.nghttp2_submit_settings(conn.session, c.NGHTTP2_FLAG_NONE, &iv, iv.len) != 0) return error.OutOfMemory;
+                const count: usize = if (conn.config.enable_connect_protocol) iv.len else iv.len - 1;
+                if (c.nghttp2_submit_settings(conn.session, c.NGHTTP2_FLAG_NONE, &iv, count) != 0) return error.OutOfMemory;
                 if (conn.config.connection_window > 65535) {
                     _ = c.nghttp2_session_set_local_window_size(conn.session, c.NGHTTP2_FLAG_NONE, 0, conn.config.connection_window);
                 }
@@ -297,6 +299,8 @@ pub fn Engine(comptime Ctx: type) type {
             path: []const u8 = "",
             authority: []const u8 = "",
             scheme: []const u8 = "",
+            /// `:protocol`, on an extended CONNECT (RFC 8441).
+            connect_protocol: []const u8 = "",
             headers: std.ArrayList(Field) = .empty,
             /// Decoded header block size so far (RFC 9113 §6.5.2).
             header_list_size: usize = 0,
@@ -672,6 +676,13 @@ pub fn Engine(comptime Ctx: type) type {
                 response.status = .not_implemented;
                 return response.write();
             };
+            // An extended CONNECT (RFC 8441; nghttp2 has checked its pseudo
+            // headers) is routed as the GET that the HTTP/1.1 upgrade it
+            // replaces would be.
+            if (request.method == .connect and stream.connect_protocol.len > 0) {
+                request.method = .get;
+                request.protocol = stream.connect_protocol;
+            }
             response.head = request.method == .head;
             request.url = stream.path;
 
@@ -1100,6 +1111,8 @@ pub fn Engine(comptime Ctx: type) type {
                 stream.authority = value;
             } else if (std.mem.eql(u8, name, ":scheme")) {
                 stream.scheme = value;
+            } else if (std.mem.eql(u8, name, ":protocol")) {
+                stream.connect_protocol = value;
             } else if (name.len > 0 and name[0] != ':') {
                 const name_copy = arena.dupe(u8, name) catch return c.NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
                 stream.headers.append(arena, .{ .name = name_copy, .value = value }) catch return c.NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;

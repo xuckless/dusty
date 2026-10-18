@@ -264,6 +264,12 @@ pub const ServerConfig = struct {
         stream_reset_rate: u64 = 33,
         /// CONTINUATION frames allowed after one HEADERS (CVE-2024-28182).
         max_continuations: usize = 8,
+        /// Advertise SETTINGS_ENABLE_CONNECT_PROTOCOL (RFC 8441), so a
+        /// client may open a WebSocket, or another protocol, on a stream
+        /// with an extended CONNECT. Such a request reaches the router as a
+        /// GET, as the HTTP/1.1 upgrade it replaces does, with
+        /// `Request.protocol` set.
+        enable_connect_protocol: bool = true,
     };
 
     pub const Timeout = struct {
