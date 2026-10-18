@@ -3525,3 +3525,34 @@ test "Server: a warm HTTP/1.1 keepalive connection serves requests without alloc
     }
     try std.testing.expectEqual(before, counting.count.load(.monotonic));
 }
+
+test "Server: serves on an inherited listening socket (fd)" {
+    const io = std.testing.io;
+    // Opened elsewhere, as systemd or a previous process would have.
+    const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var listener = try addr.listen(io, .{});
+    const fd = listener.socket.handle;
+    const port = listener.socket.address.getPort();
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(port) } }, .fd = fd }},
+    }, {});
+    defer server.deinit();
+    server.router.get("/", struct {
+        fn h(_: *dusty.Request, res: *dusty.Response) !void {
+            res.body = "inherited";
+        }
+    }.h);
+    var future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer future.cancel(io) catch {};
+    try server.ready.wait(io);
+    try std.testing.expectEqual(port, server.address.ip.getPort());
+
+    var buf: [1024]u8 = undefined;
+    const resp = try rawAll(io, &server, "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", &buf);
+    try std.testing.expect(std.mem.endsWith(u8, resp, "inherited"));
+}

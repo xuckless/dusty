@@ -105,6 +105,11 @@ pub const Listener = struct {
     /// Only for a listener that nothing but the proxy can reach, since
     /// whoever connects chooses the address the header claims.
     proxy_protocol: bool = false,
+    /// An already listening socket to serve instead of binding `address`:
+    /// one handed over by systemd socket activation (`LISTEN_FDS`) or by
+    /// the process this one replaces. `address` should still say what it
+    /// is bound to (it is read back from the socket where it can be).
+    fd: ?std.posix.fd_t = null,
     /// How many accept loops share the socket. With io_uring, an accept
     /// completes at most once per trip through the event loop, so a single
     /// loop takes one connection per trip however many are queued, which
