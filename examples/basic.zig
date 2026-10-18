@@ -96,7 +96,7 @@ fn handleJson(ctx: *AppContext, req: *http.Request, res: *http.Response) !void {
             .nested = true,
             .items = [_]i32{ 1, 2, 3, 4, 5 },
         },
-    }, .{});
+    });
 }
 
 fn handleApiUser(ctx: *AppContext, req: *http.Request, res: *http.Response) !void {
@@ -110,7 +110,7 @@ fn handleApiUser(ctx: *AppContext, req: *http.Request, res: *http.Response) !voi
         .name = name,
         .active = true,
         .roles = [_][]const u8{ "user", "viewer" },
-    }, .{});
+    });
 }
 
 fn handleCreateUser(ctx: *AppContext, req: *http.Request, res: *http.Response) !void {
@@ -124,11 +124,8 @@ fn handleCreateUser(ctx: *AppContext, req: *http.Request, res: *http.Response) !
     };
 
     // Parse JSON body
-    const user_data = try req.json(CreateUserRequest) orelse {
-        res.status = .bad_request;
-        try res.json(.{ .err = "Missing or invalid JSON body" }, .{});
-        return;
-    };
+    // A missing or malformed body is answered 400 by the server.
+    const user_data = try req.bind(CreateUserRequest);
 
     std.log.info("Creating user: name={s}, email={s}, age={?d}", .{ user_data.name, user_data.email, user_data.age });
 
@@ -140,7 +137,7 @@ fn handleCreateUser(ctx: *AppContext, req: *http.Request, res: *http.Response) !
         .email = user_data.email,
         .age = user_data.age,
         .created_at = std.Io.Timestamp.now(req.io, .real).toSeconds(),
-    }, .{});
+    });
 }
 
 pub fn runServer(allocator: std.mem.Allocator, io: std.Io) !void {
@@ -154,10 +151,8 @@ pub fn runServer(allocator: std.mem.Allocator, io: std.Io) !void {
     defer server.deinit();
 
     const cors = try server.middleware(http.middleware.Cors, .{
-        .origin = "*",
         .headers = "Content-Type, Authorization",
-        .methods = "GET, POST, PUT, DELETE, OPTIONS",
-        .max_age = "86400",
+        .max_age = 86400,
     });
     server.router.middlewares = &.{cors};
 

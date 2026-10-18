@@ -8,6 +8,8 @@ const Connection = @import("server.zig").Connection;
 pub const Sink = @import("sink.zig").Sink;
 const zlib = @import("zlib");
 const build_options = @import("build_options");
+const ErrorFormat = @import("config.zig").ErrorFormat;
+const statusBody = @import("middleware.zig").statusBody;
 const zstd_io = if (build_options.use_zstd) @import("zstd_io.zig") else struct {};
 
 var no_buf: [0]u8 = .{};
@@ -632,6 +634,9 @@ pub const Response = struct {
     /// neither `content_type` nor the header. Set by the server from
     /// `ServerConfig.response.default_content_type`.
     default_content_type: ?http.ContentType = null,
+    /// How `fail` and the server's own error answers are written. Set by
+    /// the server from `ServerConfig.errors`.
+    error_format: ErrorFormat = .auto,
     /// Trailer fields, sent after the body. Only a `sink` carries them
     /// (HTTP/2 does, for gRPC status among others); over HTTP/1.x they are
     /// dropped.
@@ -935,9 +940,16 @@ pub const Response = struct {
         _ = self.headers.remove("Content-Encoding");
     }
 
-    /// Writes `value` as the body with `std.json`. `encode` with json.zig's
-    /// `json.encode` is considerably faster for types known at compile time.
-    pub fn json(self: *Response, value: anytype, options: std.json.Stringify.Options) !void {
+    /// Writes `value` as the JSON body (`std.json`), with its content type:
+    /// `res.json(user)`. `jsonWith` takes `std.json`'s options.
+    pub fn json(self: *Response, value: anytype) !void {
+        return self.jsonWith(value, .{});
+    }
+
+    /// `json` with `std.json`'s stringify options (whitespace, nulls left
+    /// out, and so on). `encode` with json.zig's `json.encode` is
+    /// considerably faster for types known at compile time.
+    pub fn jsonWith(self: *Response, value: anytype, options: std.json.Stringify.Options) !void {
         // The open writer owns the segment being filled, and would write
         // over this, or publish a length past the end of it.
         if (self.body_writer_buffering) return error.BodyWriterOpen;
@@ -946,6 +958,46 @@ pub const Response = struct {
         defer w.interface.flush() catch unreachable;
         try json_formatter.format(&w.interface);
         try self.header("Content-Type", "application/json; charset=UTF-8");
+    }
+
+    /// Answers with `status` and `message`, in place of anything written
+    /// so far: `return res.fail(.unauthorized, "missing API key");`. The
+    /// body is `{"error":"<message>"}` when the request takes JSON or the
+    /// server answers in JSON (`ServerConfig.errors`), else `message` as
+    /// text. An empty `message` stands for the status line: "404 Not
+    /// Found\n", or `{"error":"Not Found"}`. `message` must outlive the
+    /// response (a literal, or the request's arena).
+    ///
+    /// Does nothing once the headers are on the wire: a started response
+    /// cannot become another.
+    pub fn fail(self: *Response, status: http.Status, message: []const u8) void {
+        if (self.headers_written) return;
+        self.resetBody();
+        self.status = status;
+        if (self.answersJson()) {
+            const text = if (message.len > 0) message else status.phrase();
+            self.content_type = .json;
+            self.body = std.fmt.allocPrint(self.arena, "{{\"error\":{f}}}", .{std.json.fmt(text, .{})}) catch
+                "{\"error\":\"\"}";
+        } else {
+            self.content_type = .text;
+            self.body = if (message.len > 0) message else statusBody(status);
+        }
+    }
+
+    /// Whether `fail` answers in JSON: always or never by `error_format`,
+    /// else when the request's `Accept` names JSON, or it sent JSON itself.
+    fn answersJson(self: *const Response) bool {
+        switch (self.error_format) {
+            .json => return true,
+            .text => return false,
+            .auto => {},
+        }
+        const req = self.request orelse return false;
+        if (req.headers.get("Accept")) |accept| {
+            if (std.ascii.findIgnoreCase(accept, "json") != null) return true;
+        }
+        return req.content_type == .json;
     }
 
     /// Renders a template into the body, sent as `content_type`, or as
@@ -2308,7 +2360,7 @@ test "Response: json() with simple object" {
     connection.initWriterForTesting(&conn_writer);
 
     var response = try Response.init(arena.allocator(), &connection, 32);
-    try response.json(.{ .name = "Alice", .age = 30 }, .{});
+    try response.json(.{ .name = "Alice", .age = 30 });
 
     var body_buf: [256]u8 = undefined;
     const buffered = try testBody(&response, &body_buf);
@@ -2332,7 +2384,7 @@ test "Response: json() writes complete response" {
 
     var response = try Response.init(arena.allocator(), &connection, 32);
     response.status = .created;
-    try response.json(.{ .id = 123, .message = "Created" }, .{});
+    try response.json(.{ .id = 123, .message = "Created" });
     try response.write();
 
     const written = conn_writer.buffered();
@@ -2360,7 +2412,7 @@ test "Response: json() with array" {
 
     var response = try Response.init(arena.allocator(), &connection, 32);
     const items = [_]i32{ 1, 2, 3, 4, 5 };
-    try response.json(items, .{});
+    try response.json(items);
 
     var body_buf: [256]u8 = undefined;
     const buffered = try testBody(&response, &body_buf);
@@ -2384,7 +2436,7 @@ test "Response: json() with nested object" {
             .id = 42,
         },
         .active = true,
-    }, .{});
+    });
 
     var body_buf: [256]u8 = undefined;
     const buffered = try testBody(&response, &body_buf);
@@ -3206,7 +3258,7 @@ test "Response: json is refused while a body writer is open" {
     var response = try Response.init(arena.allocator(), &connection, 32);
     var body = response.writer();
     try body.interface.writeAll("[");
-    try std.testing.expectError(error.BodyWriterOpen, response.json(.{ .a = 1 }, .{}));
+    try std.testing.expectError(error.BodyWriterOpen, response.json(.{ .a = 1 }));
     try body.interface.writeAll("]");
     try body.end();
     try response.write();

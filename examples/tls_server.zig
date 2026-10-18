@@ -10,7 +10,7 @@ fn handleJson(req: *http.Request, res: *http.Response) !void {
     try res.json(.{
         .message = "secure hello",
         .timestamp = std.Io.Timestamp.now(req.io, .real).toSeconds(),
-    }, .{});
+    });
 }
 
 pub fn main(init: std.process.Init) !void {

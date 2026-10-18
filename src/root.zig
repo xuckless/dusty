@@ -40,13 +40,33 @@ pub const CookieOpts = @import("cookie.zig").CookieOpts;
 pub const validateCookieName = @import("cookie.zig").validateCookieName;
 pub const validateCookieValue = @import("cookie.zig").validateCookieValue;
 pub const SessionData = @import("middleware/Session.zig").SessionData;
+/// `Request.locals`: per-request values a middleware hands to the handler.
+pub const Locals = @import("locals.zig").Locals;
+/// How the server writes its own error answers (`ServerConfig.errors`).
+pub const ErrorFormat = @import("config.zig").ErrorFormat;
+/// `ServerConfig.error_handler`.
+pub const ErrorHandler = @import("config.zig").ErrorHandler;
 pub const middleware = @import("middleware/middleware.zig");
 pub const Middleware = @import("middleware.zig").Middleware;
 pub const MiddlewareConfig = @import("middleware.zig").MiddlewareConfig;
 pub const Executor = @import("middleware.zig").Executor;
-/// The 4xx a handler error becomes when the app has no `uncaughtError`
-/// (null: a 500), for middleware that records the status it will send.
+/// The status a handler error stands for (status-named errors such as
+/// `error.Unauthorized`, request-body faults), or null for a 500: for
+/// middleware that records the status it will send.
+pub const errorStatus = @import("middleware.zig").errorStatus;
+/// `errorStatus` with the default answer's text body.
 pub const clientError = @import("middleware.zig").clientError;
+/// The answer the server gives an error when nothing else does, for an
+/// `uncaughtError` or `error_handler` to fall back on.
+pub const defaultError = @import("middleware.zig").defaultError;
+/// "404 Not Found\n" for a standard 4xx or 5xx status.
+pub const statusBody = @import("middleware.zig").statusBody;
+/// Fails when another socket already listens on the address, which
+/// SO_REUSEPORT would silently share.
+pub const checkAddressFree = @import("server.zig").checkAddressFree;
+/// What the startup line says about a listener: "https://127.0.0.1:8443
+/// (HTTP/2, HTTP/1.1)".
+pub const describeListener = @import("server.zig").describeListener;
 pub const StaticOptions = @import("server/static.zig").StaticOptions;
 pub const Precompressed = @import("server/static.zig").Precompressed;
 pub const EmbeddedOptions = @import("server/static.zig").EmbeddedOptions;
@@ -77,6 +97,8 @@ comptime {
     _ = @import("config.zig");
     _ = @import("middleware.zig");
     _ = @import("middleware/middleware.zig");
+    _ = @import("locals.zig");
+    _ = @import("api_test.zig");
     _ = @import("proxy_protocol.zig");
     _ = @import("fuzz.zig");
     _ = @import("request_fuzz_test.zig");

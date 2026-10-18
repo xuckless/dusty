@@ -34,7 +34,7 @@ const MiddlewareConfig = @import("middleware.zig").MiddlewareConfig;
 const cgroup = @import("cgroup.zig");
 const somaxconn = @import("somaxconn.zig").somaxconn;
 
-const log = std.log.scoped(.dusty);
+const log = std.log.scoped(.anole);
 
 /// How long the accept loop waits after failing for want of a file
 /// descriptor or memory, doubling up to the cap. Short enough that a brief
@@ -170,7 +170,11 @@ const TlsMaterial = struct {
             return error.MissingTlsCertificate;
         } else tls.config.CertKeyPair.fromFilePath(allocator, io, dir, cfg.cert_path, cfg.key_path);
         var auth = loaded catch |err| {
-            log.err("Failed to load TLS certificate/key: {}", .{err});
+            if (cfg.pem != null) {
+                log.err("cannot load the TLS certificate and key (PEM in memory): {t}", .{err});
+            } else {
+                log.err("cannot load the TLS certificate \"{s}\" and key \"{s}\": {t}", .{ cfg.cert_path, cfg.key_path, err });
+            }
             return err;
         };
         errdefer auth.deinit(allocator);
@@ -555,6 +559,71 @@ const h2_preface_line = "PRI * HTTP/2.0\r\n";
 pub const Address = @import("config.zig").Address;
 pub const Listener = @import("config.zig").Listener;
 
+/// Fails with `error.AddressInUse` when some other socket is already bound
+/// to `address`, which binding with SO_REUSEPORT (`Listener.reuse_address`)
+/// would otherwise join without a word: a second copy of a server, or a
+/// stale one, would then take a share of the connections. The probe binds
+/// with SO_REUSEADDR alone, which conflicts with any listening socket on the
+/// address, SO_REUSEPORT or not, but not with connections in TIME_WAIT
+/// from a server that just stopped. Port zero is not checked (it binds a
+/// fresh port), and nothing is checked when the probe socket cannot be had:
+/// the real bind reports what it reports.
+///
+/// The server calls it before binding an IP listener that sets
+/// `reuse_address`, and not for an inherited socket (`Listener.fd`), which
+/// is already bound; call it before opening a socket of your own that is to
+/// be handed over.
+pub fn checkAddressFree(address: std.Io.net.IpAddress) error{AddressInUse}!void {
+    if (address.getPort() == 0) return;
+    const posix = std.posix;
+    const sys = posix.system;
+    const family: u32 = switch (address) {
+        .ip4 => posix.AF.INET,
+        .ip6 => posix.AF.INET6,
+    };
+    // Not on macOS, where the flag does not exist for socket(2).
+    const cloexec: u32 = if (builtin.os.tag == .linux) posix.SOCK.CLOEXEC else 0;
+    const rc = sys.socket(family, posix.SOCK.STREAM | cloexec, 0);
+    if (posix.errno(rc) != .SUCCESS) return;
+    const fd: posix.fd_t = @intCast(rc);
+    defer _ = sys.close(fd);
+    const one: c_int = 1;
+    if (posix.errno(sys.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, @ptrCast(&one), @sizeOf(c_int))) != .SUCCESS) return;
+    var storage: std.Io.Threaded.PosixAddress = undefined;
+    const len = std.Io.Threaded.addressToPosix(&address, &storage);
+    if (posix.errno(sys.bind(fd, &storage.any, len)) == .ADDRINUSE) {
+        log.err("{f} is already in use: another process is listening on it", .{address});
+        return error.AddressInUse;
+    }
+}
+
+/// Where a listener is and what it speaks, for the line logged when it
+/// starts: "https://127.0.0.1:8443 (HTTP/2, HTTP/1.1, HTTP/3)".
+pub fn describeListener(w: *std.Io.Writer, cfg: *const Listener, address: Address) std.Io.Writer.Error!void {
+    const secure = cfg.tls != null;
+    switch (address) {
+        .ip => |ip| try w.print("{s}://{f}", .{ if (secure) "https" else "http", ip }),
+        .unix => |unix| try w.print("unix:{s}", .{unix.path}),
+    }
+    try w.writeAll(" (");
+    var first = true;
+    if (cfg.tls) |t| {
+        for (t.alpn_protocols) |p| {
+            const name = if (std.mem.eql(u8, p, "h2")) "HTTP/2" else if (std.mem.eql(u8, p, "http/1.1")) "HTTP/1.1" else p;
+            try w.print("{s}{s}", .{ if (first) "" else ", ", name });
+            first = false;
+        }
+    }
+    if (first) {
+        try w.writeAll("HTTP/1.1");
+        first = false;
+        if (!secure and cfg.http2_prior_knowledge and build_options.use_http2) try w.writeAll(", HTTP/2 cleartext");
+    }
+    for (cfg.extra_protocols) |p| try w.print(", {s}", .{p});
+    if (cfg.proxy_protocol) try w.writeAll("; PROXY protocol");
+    try w.writeAll(")");
+}
+
 fn setRequestTimeout(context: *anyopaque, io: std.Io, timeout: std.Io.Timeout) void {
     const timer: *Timer = @ptrCast(@alignCast(context));
     timer.set(io, timeout);
@@ -711,14 +780,16 @@ pub fn Server(comptime Ctx: type) type {
             const init_info = @typeInfo(@TypeOf(M.init)).@"fn";
             // Zig 0.17 replaced `params` with `param_types`.
             const init_param_count = if (@hasField(@TypeOf(init_info), "params")) init_info.params.len else init_info.param_types.len;
-            m.* = switch (init_param_count) {
-                1 => try M.init(config),
-                2 => try M.init(config, MiddlewareConfig{
+            const made = switch (init_param_count) {
+                1 => M.init(config),
+                2 => M.init(config, MiddlewareConfig{
                     .arena = arena,
                     .allocator = self.allocator,
                 }),
                 else => @compileError(@typeName(M) ++ ".init must accept 1 or 2 parameters"),
             };
+            // `init` may or may not be fallible.
+            m.* = if (@typeInfo(@TypeOf(made)) == .error_union) try made else made;
 
             const mw = Middleware(Ctx).init(m);
 
@@ -820,7 +891,7 @@ pub fn Server(comptime Ctx: type) type {
                 // `placement.concurrent`): it must reach the wait below.
                 const protection = self.io.swapCancelProtection(.blocked);
                 defer _ = self.io.swapCancelProtection(protection);
-                for (active) |*l| log.info("Listening on {f}", .{l.address});
+                for (active) |*l| logListening(l.config, l.address);
             }
 
             var connections: std.Io.Group = .init;
@@ -939,6 +1010,15 @@ pub fn Server(comptime Ctx: type) type {
             }
         }
 
+        /// One line per listener as it starts: where, and what it speaks.
+        /// "listening on https://127.0.0.1:8443 (HTTP/2, HTTP/1.1)".
+        fn logListening(cfg: *const Listener, address: Address) void {
+            var buf: [256]u8 = undefined;
+            var w: std.Io.Writer = .fixed(&buf);
+            describeListener(&w, cfg, address) catch {};
+            log.info("listening on {s}", .{w.buffered()});
+        }
+
         fn configuredListeners(self: *const Self) []const Listener {
             return if (self.config.listeners.len == 0) &default_listeners else self.config.listeners;
         }
@@ -975,10 +1055,14 @@ pub fn Server(comptime Ctx: type) type {
             }
 
             l.server = switch (cfg.address) {
-                .ip => |ip| try ip.listen(self.io, .{
-                    .kernel_backlog = kernel_backlog,
-                    .reuse_address = cfg.reuse_address,
-                }),
+                .ip => |ip| blk: {
+                    // SO_REUSEPORT would share the port with whoever has it.
+                    if (cfg.reuse_address) try checkAddressFree(ip);
+                    break :blk try ip.listen(self.io, .{
+                        .kernel_backlog = kernel_backlog,
+                        .reuse_address = cfg.reuse_address,
+                    });
+                },
                 .unix => |unix| try unix.listen(self.io, .{ .kernel_backlog = kernel_backlog }),
             };
             errdefer l.server.deinit(self.io);
@@ -1595,6 +1679,7 @@ pub fn Server(comptime Ctx: type) type {
         pub fn configureResponse(self: *const Self, res: *Response) void {
             res.send_date = self.config.response.date;
             res.default_content_type = self.config.response.default_content_type;
+            res.error_format = self.config.errors;
         }
 
         /// The client address for a request from `peer` with `headers`,
@@ -1630,13 +1715,15 @@ pub fn Server(comptime Ctx: type) type {
                 },
                 else => |e| return e,
             };
+            const miss: ?Router(Ctx).Miss = if (found == null) try self.router.miss(req) else null;
             var executor = Executor(Ctx){
                 .req = req,
                 .res = res,
                 .ctx = self.ctx,
                 .action = if (found) |r| r.action else null,
-                .middlewares = if (found) |r| r.middlewares else self.router.middlewares,
-                .allow = if (found == null) try self.router.allowedMethods(req) else null,
+                .middlewares = if (found) |r| r.middlewares else miss.?.middlewares,
+                .allow = if (miss) |m| m.allow else null,
+                .error_handler = self.config.error_handler,
             };
             try executor.run();
         }
@@ -1792,8 +1879,6 @@ pub fn Server(comptime Ctx: type) type {
                 request.secure = (build_options.use_tls and l.config.tls != null) or connection.proxied_secure;
                 applyForwardedFn(&request, connection.peerAddress(), self.config.trusted_proxy_hops);
 
-                log.debug("Received: {f} {s}", .{ request.method, request.url });
-
                 var response = try Response.init(request.arena, connection, self.config.response.max_header_count);
                 self.configureResponse(&response);
                 defer response.deinit();
@@ -1856,13 +1941,15 @@ pub fn Server(comptime Ctx: type) type {
                     },
                     else => |e| return e,
                 };
+                const miss: ?Router(Ctx).Miss = if (found == null) try self.router.miss(&request) else null;
                 var executor = Executor(Ctx){
                     .req = &request,
                     .res = &response,
                     .ctx = self.ctx,
                     .action = if (found) |r| r.action else null,
-                    .middlewares = if (found) |r| r.middlewares else self.router.middlewares,
-                    .allow = if (found == null) try self.router.allowedMethods(&request) else null,
+                    .middlewares = if (found) |r| r.middlewares else miss.?.middlewares,
+                    .allow = if (miss) |m| m.allow else null,
+                    .error_handler = self.config.error_handler,
                 };
                 executor.run() catch |err| switch (err) {
                     error.ReadFailed => return connection.getReadError() orelse error.Unexpected,

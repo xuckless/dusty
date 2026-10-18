@@ -1,12 +1,12 @@
 //! One access-log line per request, after its handler: method, path,
 //! status, time taken, client address and request ID (`req.id`, from the
 //! RequestId middleware when it runs first), at info level in scope
-//! `dusty_access`. A handler that fails is logged with its error.
+//! `access`. A handler that fails is logged with its error.
 const std = @import("std");
 const Request = @import("../request.zig").Request;
 const Response = @import("../response.zig").Response;
 
-const log = std.log.scoped(.dusty_access);
+const log = std.log.scoped(.access);
 
 const Logger = @This();
 

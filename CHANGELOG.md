@@ -4,6 +4,60 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Errors named after a status answer with it: a handler or middleware that
+  returns `error.Unauthorized` gets a 401, `error.TooManyRequests` a 429,
+  `error.ServiceUnavailable` a 503. Any standard 4xx or 5xx counts, by its
+  tag (`UnprocessableEntity`) or its RFC 9110 phrase
+  (`UnprocessableContent`). `errorStatus(err)` says which status an error
+  stands for.
+- **Breaking:** `std.json`'s error names (`SyntaxError`, `UnknownField`,
+  `MissingField` and the rest) are no longer answered with 400, so JSON that
+  fails to parse anywhere but the request body is a 500 again. The request's
+  own JSON helpers now fail with `error.InvalidJsonBody` (400), and
+  `Request.bind` with `error.MissingBody` (400) for no body.
+- Added `Response.fail(status, message)`: the status and a body, in place of
+  anything written before. The body is `{"error":"..."}` when the request
+  takes JSON (its `Accept` names JSON, or it sent JSON) and plain text
+  otherwise; `ServerConfig.errors` (`.auto`, `.json`, `.text`) settles it
+  for the whole server. An empty message stands for the status line. The
+  server's own 404, 405 and error answers go the same way.
+- Added `ServerConfig.error_handler`, a plain function that answers handler
+  errors for a server without a context, and `defaultError(req, res, err)`,
+  the default answer, for it or an `uncaughtError` to fall back on.
+- Added `Request.bind(T)`: the JSON body as a `T`, unknown fields ignored,
+  `MissingBody` without one and `InvalidJsonBody` when it does not fit.
+  `bindWith(T, options)` takes `std.json`'s options. **Breaking:**
+  `Request.json(T)` now ignores unknown fields too.
+- **Breaking:** `Response.json(value)` takes no options; `jsonWith(value,
+  options)` does.
+- Added `Request.locals`, `Request.setLocal(key, value)` and
+  `Request.local(T, key)`: typed values a middleware hands to the handler
+  for one request, in its arena.
+- `Cors` works out of the box: `Cors.init(.{})` allows any origin, answers
+  preflights with GET, HEAD, POST, PUT, PATCH and DELETE, the request
+  headers the browser asks for and a 600 s max age. Added `origins` (a
+  list, echoed with `Vary: Origin` only when listed), `credentials` (which
+  panics at `init` with every origin allowed), `expose`. A preflight from an
+  origin not allowed gets a 204 without CORS headers. **Breaking:** `init`
+  no longer fails, `origin` is optional, `max_age` is a number of seconds.
+  `Server.middleware` takes an `init` that cannot fail.
+- A CORS preflight inside a group works: an OPTIONS to a path that has
+  routes for other methods runs the middleware of the route it asks about
+  (`Router.miss`), where it used to run only the global middleware and end
+  in a 405.
+- A second server can no longer share a port by accident: before binding an
+  IP listener with `reuse_address` (SO_REUSEPORT), the server checks that
+  nothing listens on the address, and fails with `error.AddressInUse` and a
+  log line if something does (`checkAddressFree`). Connections in TIME_WAIT
+  do not count, port 0 and inherited sockets are not checked, and the
+  per-acceptor sockets of one listener still share their port.
+- Logs go under the scopes `anole` (was `dusty`), `access` (was
+  `dusty_access`) and `anole_h2` (was `dusty_h2`). The per-request
+  `Received:` debug line is gone. Each listener logs one line as it starts,
+  with its scheme and protocols: `listening on https://127.0.0.1:8443
+  (HTTP/2, HTTP/1.1)`; `Listener.extra_protocols` adds protocols served
+  beside it. A TLS certificate that will not load is logged with its paths.
+
 - Added `Server.waitReady(io)`, which returns once `run` is listening, or
   with `run`'s error (also in `Server.start_error`) once it has stopped
   without getting there: a certificate that will not load, a port in use.

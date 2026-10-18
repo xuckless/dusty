@@ -58,7 +58,7 @@ const Ctx = struct {
 /// plain-text fallback needs no allocation at all.
 fn fail(res: *Response, status: http.Status, comptime message: []const u8) void {
     res.status = status;
-    res.json(.{ .@"error" = message, .status = @intFromEnum(status) }, .{}) catch {
+    res.json(.{ .@"error" = message, .status = @intFromEnum(status) }) catch {
         res.content_type = .text;
         res.body = message ++ "\n";
     };
@@ -180,7 +180,7 @@ fn handleIndex(_: *Ctx, _: *Request, res: *Response) !void {
 }
 
 fn handleGet(_: *Ctx, req: *Request, res: *Response) !void {
-    try res.json(try describe(req, res, .{}), Description.options);
+    try res.jsonWith(try describe(req, res, .{}), Description.options);
 }
 
 /// Shared by the methods that carry a body: post, put, patch, delete.
@@ -198,7 +198,7 @@ fn sendDescription(req: *Request, res: *Response, with_method: bool) !void {
         error.InvalidEscapeSequence, error.TooManyFormFields => return fail(res, .bad_request, "Invalid form body"),
         else => |e| return e,
     };
-    try res.json(desc, Description.options);
+    try res.jsonWith(desc, Description.options);
 }
 
 /// Answers whatever the request method was. Unlike the others this always
@@ -209,15 +209,15 @@ fn handleAnything(_: *Ctx, req: *Request, res: *Response) !void {
 }
 
 fn handleHeaders(_: *Ctx, req: *Request, res: *Response) !void {
-    try res.json(.{ .headers = req.headers }, .{});
+    try res.json(.{ .headers = req.headers });
 }
 
 fn handleIp(_: *Ctx, req: *Request, res: *Response) !void {
-    try res.json(.{ .origin = Origin{ .address = req.remote_address } }, .{});
+    try res.json(.{ .origin = Origin{ .address = req.remote_address } });
 }
 
 fn handleUserAgent(_: *Ctx, req: *Request, res: *Response) !void {
-    try res.json(.{ .user_agent = req.headers.get("User-Agent") orelse "" }, .{});
+    try res.json(.{ .user_agent = req.headers.get("User-Agent") orelse "" });
 }
 
 fn handleStatus(_: *Ctx, req: *Request, res: *Response) !void {
@@ -330,7 +330,7 @@ fn handleSse(_: *Ctx, req: *Request, res: *Response) !void {
 }
 
 fn handleCookies(_: *Ctx, req: *Request, res: *Response) !void {
-    try res.json(.{ .cookies = req.cookies() }, .{});
+    try res.json(.{ .cookies = req.cookies() });
 }
 
 fn handleCookiesSet(_: *Ctx, req: *Request, res: *Response) !void {
