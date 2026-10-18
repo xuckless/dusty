@@ -114,7 +114,7 @@ pub fn Executor(comptime Ctx: type) type {
                     // By what it was answered with, which an `uncaughtError`
                     // or `error_handler` may have chosen: a 4xx is the
                     // request's fault, a 5xx the server's.
-                    if (@backingInt(self.res.status) < 500) {
+                    if (@intFromEnum(self.res.status) < 500) {
                         log.debug("request rejected: {} ({f} {s})", .{ err, self.req.method, self.req.url });
                     } else {
                         log.err("unhandled error in request handler: {} ({f} {s})", .{ err, self.req.method, self.req.url });
@@ -265,7 +265,7 @@ const status_errors = blk: {
     var kvs: [standard_error_codes.len * 2]struct { []const u8, http.Status } = undefined;
     var n = 0;
     for (standard_error_codes) |code| {
-        const status: http.Status = @fromBackingInt(@intCast(code));
+        const status: http.Status = @enumFromInt(code);
         kvs[n] = .{ pascalCase(@tagName(status)), status };
         n += 1;
         const from_phrase = pascalCase(standardPhrase(code));
@@ -280,7 +280,7 @@ const status_errors = blk: {
 /// `Status.phrase` for a standard code, at compile time (the fallback
 /// there asks llhttp, which compile time cannot).
 fn standardPhrase(comptime code: u16) []const u8 {
-    const status: http.Status = @fromBackingInt(@intCast(code));
+    const status: http.Status = @enumFromInt(code);
     return status.phrase();
 }
 
@@ -293,7 +293,7 @@ const status_bodies = blk: {
 
 /// "404 Not Found\n" for a standard 4xx or 5xx code; empty for another.
 pub fn statusBody(status: http.Status) []const u8 {
-    const code = @backingInt(status);
+    const code = @intFromEnum(status);
     for (standard_error_codes, status_bodies) |c, body| if (c == code) return body;
     return "";
 }

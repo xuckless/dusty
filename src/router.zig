@@ -536,8 +536,13 @@ pub fn Router(comptime Ctx: type) type {
             }.handle;
         }
 
+        /// Routes under `prefix` that run `middlewares` after the global
+        /// ones. The list is copied, so it may be a temporary (`&.{mw}`)
+        /// on a frame that returns before the server runs; the
+        /// middlewares it points at must still outlive the router.
         pub fn group(self: *Self, prefix: []const u8, middlewares: []const Middleware(Ctx)) Group {
-            return .{ .router = self, .prefix = prefix, .middlewares = middlewares };
+            const owned = self.arena.allocator().dupe(Middleware(Ctx), middlewares) catch @panic("OOM");
+            return .{ .router = self, .prefix = prefix, .middlewares = owned };
         }
 
         /// Adds a global middleware, run before every route's own, in the
@@ -1584,6 +1589,43 @@ test "Group: no global middlewares, only group middlewares" {
     const route = try router.findHandler(&req);
     try std.testing.expect(route != null);
     try std.testing.expectEqual(1, route.?.middlewares.len);
+}
+
+test "Group: keeps its own copy of the middleware list" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var router = TestVoidRouter.init(std.testing.allocator);
+    defer router.deinit();
+
+    const TestMw = struct {
+        id: u8,
+        pub fn execute(_: *const @This(), _: *Request, _: *Response, _: *@import("middleware.zig").Executor(void)) !void {}
+    };
+
+    var mw_group = TestMw{ .id = 1 };
+    var mw_other = TestMw{ .id = 2 };
+    // The caller's list, gone (here: overwritten) once `group` returns,
+    // as a `&.{mw}` on a helper's frame is when the server runs.
+    var list = [_]Middleware(void){Middleware(void).init(&mw_group)};
+    const api = router.group("/api", &list);
+    list[0] = Middleware(void).init(&mw_other);
+    api.get("/users", voidHandler1);
+    api.group("/v1", &.{}).get("/users", voidHandler1);
+
+    for ([_][]const u8{ "/api/users", "/api/v1/users" }) |url| {
+        var req = Request{
+            .method = .get,
+            .url = url,
+            .arena = arena.allocator(),
+            .parser = undefined,
+            .transport = undefined,
+        };
+        const route = try router.findHandler(&req);
+        try std.testing.expect(route != null);
+        try std.testing.expectEqual(1, route.?.middlewares.len);
+        try std.testing.expect(route.?.middlewares[0].ptr == @as(*anyopaque, @ptrCast(&mw_group)));
+    }
 }
 
 test "Group: direct routes have no middlewares when none set" {
