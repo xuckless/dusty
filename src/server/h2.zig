@@ -80,6 +80,12 @@ const body_writer_len = 16 * 1024;
 /// The PING sent with a drain's GOAWAY notice.
 const drain_ping: [8]u8 = "dusty-go".*;
 
+/// After the peer's side of the connection ended cleanly, while handlers
+/// still run, how often the writer sends a PING to learn whether the peer
+/// only half-closed (it may still read their responses) or is gone (the
+/// write after its reset fails, and the handlers are canceled).
+const half_close_probe_interval: std.Io.Duration = .fromMilliseconds(500);
+
 pub fn Engine(comptime Ctx: type) type {
     return struct {
         const Server = @import("../server.zig").Server(Ctx);
@@ -313,6 +319,10 @@ pub fn Engine(comptime Ctx: type) type {
             body_done: bool = false,
             /// The peer reset the stream, or the connection went away.
             reset: bool = false,
+            /// The handler's task while it runs, to cancel it when `reset`
+            /// comes before the response is complete. Set and cleared by
+            /// the task itself, under the mutex; null off zio.
+            task: ?placement.Task = null,
 
             /// Response: what the handler's head was, and whether it has
             /// been submitted to the session.
@@ -386,6 +396,16 @@ pub fn Engine(comptime Ctx: type) type {
                 stream.body_done = true;
                 if (stream.body) |*q| q.close(stream.conn.io);
             }
+
+            /// The stream is reset or the connection gone before the
+            /// handler ended its response: cancel the handler, so a wait it
+            /// is in (a timer, a database call, a full queue) returns
+            /// `error.Canceled` instead of running on for nobody. Under the
+            /// mutex, which the task takes to clear `task` before it ends.
+            fn cancelHandler(stream: *Stream) void {
+                if (stream.ended or stream.handler_done) return;
+                if (stream.task) |task| placement.cancelTask(task);
+            }
         };
 
         /// Runs HTTP/2 over an initialized connection. The calling task is
@@ -450,9 +470,11 @@ pub fn Engine(comptime Ctx: type) type {
             // The writer and the streams stay on the connection's executor.
             try placement.concurrent(&group, conn.io, .local, writerLoop, .{&conn});
 
+            var reader_failed = false;
             readerLoop(&conn, &group) catch |err| switch (err) {
                 error.Canceled => return error.Canceled,
                 else => {
+                    reader_failed = true;
                     if (Connection.isPeerGone(err)) {
                         log.debug("HTTP/2 connection closed by peer: {}", .{err});
                     } else {
@@ -464,16 +486,21 @@ pub fn Engine(comptime Ctx: type) type {
             // Let the writer send what the session still has (a GOAWAY after
             // a protocol error, the last responses), then stop. No more
             // request body can arrive, so a handler waiting for one is told
-            // the stream is gone rather than left to its timeout.
+            // the stream is gone rather than left to its timeout, and is
+            // canceled. After a clean end of the peer's side (which may be
+            // a half-close) a handler with its whole request keeps running,
+            // for a response that may still go out; after a read error the
+            // connection is gone, and every handler is canceled.
             {
                 conn.lock();
                 defer conn.unlock();
                 conn.closing = true;
                 var it = conn.streams.valueIterator();
                 while (it.next()) |stream| {
-                    if (!stream.*.body_done) {
+                    if (reader_failed or !stream.*.body_done) {
                         stream.*.reset = true;
                         stream.*.closeBody();
+                        stream.*.cancelHandler();
                     }
                 }
             }
@@ -536,7 +563,8 @@ pub fn Engine(comptime Ctx: type) type {
 
         fn writerLoop(conn: *Conn) std.Io.Cancelable!void {
             // Nothing goes out once the writer is gone, so a handler blocked
-            // on a full response queue is let go.
+            // on a full response queue is let go, and any handler still
+            // working on a response is canceled.
             defer {
                 conn.lock();
                 defer conn.unlock();
@@ -544,6 +572,7 @@ pub fn Engine(comptime Ctx: type) type {
                 while (it.next()) |stream| {
                     stream.*.reset = true;
                     if (stream.*.out) |*q| q.close(conn.io);
+                    stream.*.cancelHandler();
                 }
             }
             runWriter(conn) catch |err| switch (err) {
@@ -563,6 +592,7 @@ pub fn Engine(comptime Ctx: type) type {
             var staging: std.ArrayList(u8) = .empty;
             defer staging.deinit(conn.allocator);
             const writer = conn.connection.writer;
+            var probed = false;
             while (true) {
                 const gen = conn.write_gen.load(.acquire);
                 var closing = false;
@@ -613,6 +643,20 @@ pub fn Engine(comptime Ctx: type) type {
                     return;
                 }
                 if (closing and !handlers_running) return;
+                if (closing) {
+                    // A peer that closed the whole connection answers the
+                    // probe with a TCP reset, so the next write fails;
+                    // one that half-closed reads it and stays served.
+                    if (probed) {
+                        try conn.io.futexWaitTimeout(u32, &conn.write_gen.raw, gen, .{ .duration = .{ .raw = half_close_probe_interval, .clock = .awake } });
+                        if (conn.write_gen.load(.acquire) != gen) continue;
+                    }
+                    probed = true;
+                    conn.lock();
+                    _ = c.nghttp2_submit_ping(conn.session, c.NGHTTP2_FLAG_NONE, null);
+                    conn.unlock();
+                    continue;
+                }
                 try conn.io.futexWait(u32, &conn.write_gen.raw, gen);
             }
         }
@@ -620,15 +664,40 @@ pub fn Engine(comptime Ctx: type) type {
         // -- One stream: a request in, a response out --------------------
 
         fn runStream(conn: *Conn, stream: *Stream) std.Io.Cancelable!void {
+            // Published for `cancelHandler`, and taken back under the mutex
+            // before the task ends, so a cancel never reaches a task that
+            // is gone.
+            const task = placement.currentTask(conn.io);
+            const gone = gone: {
+                conn.lock();
+                defer conn.unlock();
+                stream.task = task;
+                break :gone stream.reset;
+            };
             defer {
                 conn.lock();
                 defer conn.unlock();
+                stream.task = null;
                 if (stream.response_sent and !stream.body_done and !stream.reset) startDiscard(conn, stream);
                 stream.release(.handler);
                 conn.kickWriter();
             }
+            // Reset before its task got to run: nobody wants the response.
+            if (gone) {
+                log.debug("HTTP/2 stream {d} reset before its handler started", .{stream.id});
+                return;
+            }
             serveStream(conn, stream) catch |err| {
                 if (err == error.Canceled) {
+                    conn.lock();
+                    const reset = stream.reset;
+                    conn.unlock();
+                    // Canceled because the peer reset the stream or the
+                    // connection went away: the stream is over already.
+                    if (reset) {
+                        log.debug("HTTP/2 stream {d}: handler canceled, the stream was reset", .{stream.id});
+                        return;
+                    }
                     resetStream(conn, stream, c.NGHTTP2_CANCEL);
                     return error.Canceled;
                 }
@@ -1291,6 +1360,7 @@ pub fn Engine(comptime Ctx: type) type {
             if (error_code != c.NGHTTP2_NO_ERROR or !stream.ended) stream.reset = true;
             stream.closeBody();
             if (stream.out) |*q| q.close(conn.io);
+            if (stream.reset) stream.cancelHandler();
             stream.release(.protocol);
             conn.kickWriter();
             return 0;

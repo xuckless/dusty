@@ -725,3 +725,83 @@ test "HTTP/2: a finished tunnel is reset even when the peer keeps its side open"
     try std.testing.expectEqualStrings("done", client.get(id).body.items);
     try std.testing.expectEqual(@as(u32, c.NGHTTP2_NO_ERROR), client.get(id).error_code);
 }
+
+/// A handler that waits up to 10 s for its client to leave. On zio the
+/// wait itself is canceled; elsewhere `peerGone` tells.
+const Waiter = struct {
+    var done: std.atomic.Value(bool) = .init(false);
+
+    fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+        defer done.store(true, .release);
+        for (0..200) |_| {
+            try req.io.sleep(.fromMilliseconds(50), .awake);
+            if (res.peerGone()) return;
+        }
+        res.body = "nobody asked";
+    }
+
+    /// Sends what the client has queued (the request) and waits until the
+    /// handler is surely running.
+    fn start(client: *TestClient, io: std.Io) !void {
+        done.store(false, .release);
+        while (true) {
+            var data: [*c]const u8 = undefined;
+            const n = c.nghttp2_session_mem_send2(client.session, &data);
+            if (n <= 0) break;
+            try client.w.writeAll(data[0..@intCast(n)]);
+        }
+        try client.w.flush();
+        try io.sleep(.fromMilliseconds(100), .awake);
+        try std.testing.expect(!done.load(.acquire));
+    }
+
+    fn expectDoneWithin(io: std.Io, since: std.Io.Clock.Timestamp, ms: i64) !void {
+        while (!done.load(.acquire)) {
+            try std.testing.expect(since.durationTo(.now(io, .awake)).raw.toMilliseconds() < ms);
+            try io.sleep(.fromMilliseconds(10), .awake);
+        }
+    }
+};
+
+test "HTTP/2: a handler is let go when the client resets its stream, and the connection carries on" {
+    const io = std.testing.io;
+    var fx: Fixture = undefined;
+    try fx.start(io);
+    defer fx.stop(io);
+    fx.server.router.get("/wait", Waiter.handle);
+
+    var client: TestClient = undefined;
+    try client.init(std.testing.allocator, io, fx.server.address.ip);
+    defer client.deinit();
+    const id = try client.request("GET", "/wait", null);
+    try Waiter.start(&client, io);
+
+    const reset_at: std.Io.Clock.Timestamp = .now(io, .awake);
+    _ = c.nghttp2_submit_rst_stream(client.session, c.NGHTTP2_FLAG_NONE, id, c.NGHTTP2_CANCEL);
+    try client.run();
+    try std.testing.expectEqual(@as(u32, c.NGHTTP2_CANCEL), client.get(id).error_code);
+    try Waiter.expectDoneWithin(io, reset_at, 2000);
+
+    // The same connection still serves.
+    const next = try client.request("GET", "/hello", null);
+    try client.run();
+    try std.testing.expectEqualStrings("hello", client.get(next).body.items);
+}
+
+test "HTTP/2: a handler is let go when the client closes the connection" {
+    const io = std.testing.io;
+    var fx: Fixture = undefined;
+    try fx.start(io);
+    defer fx.stop(io);
+    fx.server.router.get("/wait", Waiter.handle);
+
+    var client: TestClient = undefined;
+    try client.init(std.testing.allocator, io, fx.server.address.ip);
+    _ = try client.request("GET", "/wait", null);
+    try Waiter.start(&client, io);
+    // The request is whole, so the end of the connection could be a
+    // half-close: the server learns otherwise from its probe's failure.
+    const closed_at: std.Io.Clock.Timestamp = .now(io, .awake);
+    client.deinit();
+    try Waiter.expectDoneWithin(io, closed_at, 3000);
+}
