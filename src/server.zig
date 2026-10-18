@@ -1053,7 +1053,13 @@ pub fn Server(comptime Ctx: type) type {
                     error.Unexpected,
                     => {
                         backoff_ms = if (backoff_ms == 0) min_accept_backoff_ms else @min(backoff_ms * 2, max_accept_backoff_ms);
-                        log.warn("Accept failed: {}; retrying in {d}ms", .{ err, backoff_ms });
+                        {
+                            // Logging allocates too: the cancel must reach
+                            // the sleep below (see the spawn further down).
+                            const protection = self.io.swapCancelProtection(.blocked);
+                            defer _ = self.io.swapCancelProtection(protection);
+                            log.warn("Accept failed: {}; retrying in {d}ms", .{ err, backoff_ms });
+                        }
                         // A cancel is taken here, not deferred to the accept
                         // above with `recancel`. That accept keeps failing
                         // for its own reason -- the fd table is full, which
@@ -1076,6 +1082,19 @@ pub fn Server(comptime Ctx: type) type {
                     return err;
                 };
                 _ = self.busy.fetchAdd(.{ .count = 1 }, .acq_rel);
+                // Spawning is not a cancelation point, yet under
+                // std.Io.Threaded it can swallow a cancel: a Debug allocator
+                // captures a stack trace for the new task, and Zig 0.17's
+                // unwinder takes a cancelable lock (`std.debug.SelfInfo`'s
+                // module mutex, through `std.Options.debug_io`). Threaded
+                // keeps cancel state per OS thread, whichever instance asks,
+                // so when that lock is contended it acknowledges the cancel
+                // pending on this task and the unwinder drops the error.
+                // Every later syscall of the task then runs uncancelable, the
+                // next `accept` blocks for good, and the shutdown with it.
+                // Blocked here, the cancel stays pending for that `accept`.
+                const protection = self.io.swapCancelProtection(.blocked);
+                defer _ = self.io.swapCancelProtection(protection);
                 // On the executor that accepted it, for its whole life.
                 placement.concurrent(connections, self.io, .local, handleConnectionWrapper, .{ self, l, stream }) catch |err| {
                     log.err("Failed to spawn connection handler: {}", .{err});
