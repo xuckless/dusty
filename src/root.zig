@@ -40,6 +40,9 @@ pub const middleware = @import("middleware/middleware.zig");
 pub const Middleware = @import("middleware.zig").Middleware;
 pub const MiddlewareConfig = @import("middleware.zig").MiddlewareConfig;
 pub const Executor = @import("middleware.zig").Executor;
+/// The 4xx a handler error becomes when the app has no `uncaughtError`
+/// (null: a 500), for middleware that records the status it will send.
+pub const clientError = @import("middleware.zig").clientError;
 pub const StaticOptions = @import("server/static.zig").StaticOptions;
 pub const Precompressed = @import("server/static.zig").Precompressed;
 pub const EmbeddedOptions = @import("server/static.zig").EmbeddedOptions;
