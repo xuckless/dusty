@@ -3220,3 +3220,64 @@ fn repeat(comptime s: []const u8, comptime n: usize) []const u8 {
         return &final;
     }
 }
+
+test "Server: router.use with RequestId and Logger, and nested groups" {
+    const io = std.testing.io;
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
+    defer server.deinit();
+
+    var request_id = dusty.middleware.RequestId.init(.{});
+    var logger = dusty.middleware.Logger.init();
+    server.router.use(dusty.Middleware(void).init(&request_id));
+    server.router.use(dusty.Middleware(void).init(&logger));
+
+    const Tag = struct {
+        value: []const u8,
+        pub fn execute(self: *const @This(), req: *dusty.Request, res: *dusty.Response, executor: anytype) !void {
+            _ = req;
+            try res.header("X-Group", self.value);
+            return executor.next();
+        }
+    };
+    var outer_tag: Tag = .{ .value = "outer" };
+    var inner_tag: Tag = .{ .value = "inner" };
+    const outer_mws = [_]dusty.Middleware(void){dusty.Middleware(void).init(&outer_tag)};
+    const inner_mws = [_]dusty.Middleware(void){dusty.Middleware(void).init(&inner_tag)};
+    const api = server.router.group("/api", &outer_mws);
+    const v1 = api.group("/v1", &inner_mws);
+    v1.get("/id", struct {
+        fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+            res.body = req.id;
+        }
+    }.handle);
+
+    var future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer future.cancel(io) catch {};
+    try server.ready.wait(io);
+
+    const stream = try server.address.ip.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    var wbuf: [256]u8 = undefined;
+    var w = stream.writer(io, &wbuf);
+    try w.interface.writeAll("GET /api/v1/id HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    try w.interface.flush();
+    var rbuf: [1024]u8 = undefined;
+    var r = stream.reader(io, &rbuf);
+    var out: [2048]u8 = undefined;
+    var fw: std.Io.Writer = .fixed(&out);
+    _ = r.interface.streamRemaining(&fw) catch {};
+    const resp = fw.buffered();
+
+    try std.testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 200 OK\r\n"));
+    // Both groups' middleware ran, outer first (the later header wins).
+    try std.testing.expect(std.mem.indexOf(u8, resp, "X-Group: inner") != null);
+    const id_at = std.mem.indexOf(u8, resp, "X-Request-Id: ").? + "X-Request-Id: ".len;
+    const id = resp[id_at..][0..32];
+    for (id) |ch| try std.testing.expect(std.ascii.isHex(ch));
+    // The handler saw the same ID.
+    try std.testing.expect(std.mem.endsWith(u8, resp, id));
+}
