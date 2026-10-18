@@ -1,6 +1,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const tls = @import("tls");
+/// See client.zig: the TLS module's trust store, loaded once per listener.
+const has_trust_store = build_options.use_tls and @hasDecl(tls, "TrustStore");
+const TrustStore = if (has_trust_store) tls.TrustStore else void;
 const build_options = @import("build_options");
 
 const Router = @import("router.zig").Router;
@@ -133,6 +136,7 @@ fn applyForwardedFn(request: *Request, peer: std.Io.net.IpAddress, trusted_proxy
 /// connection. The bundle is owned by the Server and outlives every connection.
 const ClientAuthRef = struct {
     bundle: *std.crypto.Certificate.Bundle,
+    trust: ?*const TrustStore,
     mode: ServerConfig.Tls.ClientAuth.Mode,
 };
 
@@ -253,12 +257,16 @@ pub const Connection = struct {
             .auth = auth,
             // Built here rather than passed in as a tls.config.ClientAuth, so
             // tls_stub.zig does not have to mirror the type.
-            .client_auth = if (client_auth) |ca| .{
-                .root_ca = ca.bundle.*,
-                .auth_type = switch (ca.mode) {
-                    .request => .request,
-                    .require => .require,
-                },
+            .client_auth = if (client_auth) |ca| blk: {
+                var auth_options: tls.config.ClientAuth = .{
+                    .root_ca = ca.bundle.*,
+                    .auth_type = switch (ca.mode) {
+                        .request => .request,
+                        .require => .require,
+                    },
+                };
+                if (comptime has_trust_store) auth_options.trust = ca.trust;
+                break :blk auth_options;
             } else null,
             .now = std.Io.Clock.real.now(io),
             .rng = self.tls_rng.interface(),
@@ -510,6 +518,7 @@ pub fn Server(comptime Ctx: type) type {
             extra_servers: []std.Io.net.Server = &.{},
             tls_auth: ?tls.config.CertKeyPair = null,
             tls_client_ca: ?std.crypto.Certificate.Bundle = null,
+            tls_client_trust: ?TrustStore = null,
             client_auth_mode: ServerConfig.Tls.ClientAuth.Mode = .require,
 
             fn freeTls(l: *ActiveListener, allocator: std.mem.Allocator) void {
@@ -522,6 +531,10 @@ pub fn Server(comptime Ctx: type) type {
                         bundle.deinit(allocator);
                         l.tls_client_ca = null;
                     }
+                    if (comptime has_trust_store) if (l.tls_client_trust) |*t| {
+                        t.deinit();
+                        l.tls_client_trust = null;
+                    };
                 }
             }
 
@@ -789,6 +802,9 @@ pub fn Server(comptime Ctx: type) type {
                         log.err("Failed to load client certificate authorities: {}", .{err});
                         return err;
                     };
+                    if (comptime has_trust_store) {
+                        l.tls_client_trust = try TrustStore.init(l.tls_client_ca.?);
+                    }
                 }
             }
 
@@ -1305,6 +1321,7 @@ pub fn Server(comptime Ctx: type) type {
 
                         const client_auth: ?ClientAuthRef = if (l.tls_client_ca) |*bundle| .{
                             .bundle = bundle,
+                            .trust = if (l.tls_client_trust) |*t| t else null,
                             .mode = l.client_auth_mode,
                         } else null;
 
