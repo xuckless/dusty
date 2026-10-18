@@ -313,11 +313,20 @@ pub fn Engine(comptime Ctx: type) type {
             };
 
             // Let the writer send what the session still has (a GOAWAY after
-            // a protocol error, the last responses), then stop.
+            // a protocol error, the last responses), then stop. No more
+            // request body can arrive, so a handler waiting for one is told
+            // the stream is gone rather than left to its timeout.
             {
                 conn.lock();
                 defer conn.unlock();
                 conn.closing = true;
+                var it = conn.streams.valueIterator();
+                while (it.next()) |stream| {
+                    if (!stream.*.body_done) {
+                        stream.*.reset = true;
+                        stream.*.closeBody();
+                    }
+                }
             }
             conn.kickWriter();
             group.await(conn.io) catch |err| switch (err) {
@@ -377,6 +386,17 @@ pub fn Engine(comptime Ctx: type) type {
         }
 
         fn writerLoop(conn: *Conn) std.Io.Cancelable!void {
+            // Nothing goes out once the writer is gone, so a handler blocked
+            // on a full response queue is let go.
+            defer {
+                conn.lock();
+                defer conn.unlock();
+                var it = conn.streams.valueIterator();
+                while (it.next()) |stream| {
+                    stream.*.reset = true;
+                    if (stream.*.out) |*q| q.close(conn.io);
+                }
+            }
             runWriter(conn) catch |err| switch (err) {
                 error.Canceled => return error.Canceled,
                 else => {
