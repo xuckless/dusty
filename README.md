@@ -63,6 +63,24 @@ The application declares `custom_tls` in its own `build.zig.zon`, so it can
 point to another commit, fork, or local path. Omitting the injected module is a
 compile error. Use `.use_tls = false` instead when TLS should be compiled out.
 
+### HTTP/2
+
+Built with `.use_http2 = true`, a server speaks HTTP/2 (through nghttp2) to
+clients that ask for it, on the same router and handlers:
+
+```zig
+.listeners = &.{
+    // TLS: negotiated through ALPN.
+    .{ .address = addr443, .tls = .{ .cert_path = "server.pem", .key_path = "server.key", .alpn_protocols = &.{ "h2", "http/1.1" } } },
+    // Cleartext: HTTP/2 for a client that starts with the preface, HTTP/1.x otherwise.
+    .{ .address = addr80, .http2_prior_knowledge = true },
+},
+.http2 = .{ .max_concurrent_streams = 250 },
+```
+
+A handler can add trailer fields with `res.trailer(name, value)`; they are
+sent over HTTP/2 and dropped over HTTP/1.x.
+
 ### Using your own nghttp2
 
 With `.use_http2 = true` Dusty compiles its vendored nghttp2. An application
