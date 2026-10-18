@@ -820,7 +820,7 @@ pub fn Engine(comptime Ctx: type) type {
         /// The response side of a stream, for `Response.initSink`.
         const StreamSink = struct {
             stream: *Stream,
-            writer: std.Io.Writer = .{ .vtable = &.{ .drain = drain }, .buffer = &.{} },
+            writer: std.Io.Writer = .{ .vtable = &.{ .drain = drain, .flush = flushFn }, .buffer = &.{} },
             err: ?Response.SendError = null,
 
             fn sink(self: *StreamSink) Sink {
@@ -924,6 +924,27 @@ pub fn Engine(comptime Ctx: type) type {
                 }
                 stream.submitted = true;
                 conn.kickWriter();
+            }
+
+            /// Sends the head now even with no body bytes yet, so a stream
+            /// that stays open (an RFC 8441 tunnel, event stream) gets its
+            /// HEADERS out before the first DATA. `std.Io.Writer`'s default
+            /// flush only drains buffered bytes.
+            fn flushFn(w: *std.Io.Writer) std.Io.Writer.Error!void {
+                const self: *StreamSink = @alignCast(@fieldParentPtr("writer", w));
+                const stream = self.stream;
+                const conn = stream.conn;
+                {
+                    conn.lock();
+                    defer conn.unlock();
+                    if (stream.out == null) {
+                        const buf = stream.arena.allocator().alloc(u8, out_queue_len) catch return self.fail(error.SystemResources);
+                        stream.out = .init(buf);
+                    }
+                    try self.submit(true);
+                }
+                try self.put(w.buffered());
+                w.end = 0;
             }
 
             /// Moves body bytes into the stream's queue, blocking while it
