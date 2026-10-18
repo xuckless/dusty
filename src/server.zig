@@ -179,6 +179,8 @@ pub const Connection = struct {
     // them, and tls_reader/tls_writer expose the cleartext Reader/Writer used
     // for HTTP I/O.
     tls_conn: ?tls.Connection = null,
+    /// `closeNotify` ran.
+    close_notify_sent: bool = false,
     /// What a PROXY protocol header said, on a `Listener.proxy_protocol`
     /// listener: the client address, and whether the client spoke TLS to
     /// the proxy.
@@ -352,6 +354,21 @@ pub const Connection = struct {
             self.tls_conn = null;
         }
         self.allocator.free(self.buffers);
+    }
+
+    /// Sends TLS close_notify, once, so the peer can tell the end of the
+    /// stream from a truncation. Best effort: the peer may be gone. Only
+    /// while no other task writes to the connection, and before the
+    /// transport is shut down. Nothing for a plain connection, or for a TLS
+    /// module without `close`.
+    pub fn closeNotify(self: *Connection) void {
+        if (!build_options.use_tls) return;
+        const c = if (self.tls_conn) |*c| c else return;
+        if (self.close_notify_sent) return;
+        self.close_notify_sent = true;
+        if (comptime !@hasDecl(tls.Connection, "close")) return;
+        const R = @typeInfo(@TypeOf(tls.Connection.close)).@"fn".return_type.?;
+        if (comptime @typeInfo(R) == .error_union) c.close() catch {} else c.close();
     }
 
     /// The protocol the client and server agreed on through ALPN, or null
@@ -1190,6 +1207,7 @@ pub fn Server(comptime Ctx: type) type {
                 self.request_buffers.release(b);
                 buffers.* = null;
             }
+            self.closeNotify(connection, timer);
             connection.stream.shutdown(self.io, .send) catch |err| switch (err) {
                 // Already gone: nothing left to throw away.
                 error.SocketUnconnected, error.ConnectionResetByPeer, error.ConnectionAborted => return,
@@ -1205,6 +1223,33 @@ pub fn Server(comptime Ctx: type) type {
                 if (Connection.isPeerGone(cause)) return;
                 return cause;
             };
+        }
+
+        /// `Connection.closeNotify`, bounded by `linger_timeout` where the
+        /// timer can bound it: a peer that stopped reading must not hold the
+        /// task on the last 24 bytes.
+        fn closeNotify(self: *Self, connection: *Connection, timer: *Timer) void {
+            if (connection.tls_conn == null or connection.close_notify_sent) return;
+            const bounded = timer.canBound();
+            if (bounded) timer.set(self.io, .{ .duration = .{ .raw = linger_timeout, .clock = .awake } });
+            defer if (bounded) timer.clear(self.io);
+            connection.closeNotify();
+        }
+
+        /// After a refused TLS handshake: the alert has been flushed, but
+        /// closing with the client's flight still unread would make the
+        /// kernel send a reset, which can overtake the alert. So shut down
+        /// the send side and read what the client still sends, until it
+        /// hangs up, `linger_timeout`, or `linger_limit` bytes. Skipped
+        /// where the timer cannot bound the reads.
+        fn lingerAfterRefusal(self: *Self, stream: std.Io.net.Stream, timer: *Timer) void {
+            if (!timer.canBound()) return;
+            stream.shutdown(self.io, .send) catch return;
+            timer.set(self.io, .{ .duration = .{ .raw = linger_timeout, .clock = .awake } });
+            defer timer.clear(self.io);
+            var buf: [512]u8 = undefined;
+            var r = stream.reader(self.io, &buf);
+            _ = r.interface.discardShort(linger_limit) catch {};
         }
 
         fn handleConnection(self: *Self, l: *ActiveListener, stream: std.Io.net.Stream, watch: ?*Watch) !void {
@@ -1289,6 +1334,7 @@ pub fn Server(comptime Ctx: type) type {
                                 // flood the error log (nginx logs these at
                                 // info too).
                                 log.info("TLS handshake failed: {}", .{cause});
+                                self.lingerAfterRefusal(stream, &timer);
                             }
                             return;
                         };
@@ -1298,10 +1344,14 @@ pub fn Server(comptime Ctx: type) type {
                     connection.proxied_secure = proxied.ssl;
                     if (build_options.use_http2) {
                         if (connection.negotiatedProtocol()) |p| if (std.mem.eql(u8, p, "h2")) {
-                            return h2.Engine(Ctx).serve(self, l.config, true, &connection, &busy);
+                            // The engine's tasks have all ended when it
+                            // returns, so this is the only writer left.
+                            try h2.Engine(Ctx).serve(self, l.config, true, &connection, &busy);
+                            return self.closeNotify(&connection, &timer);
                         };
                     }
-                    return self.handleRequests(l, &connection, &timer, &busy, accepted_at);
+                    try self.handleRequests(l, &connection, &timer, &busy, accepted_at);
+                    return self.closeNotify(&connection, &timer);
                 }
             }
 
