@@ -328,3 +328,131 @@ test "parse: random and mutated input never crashes" {
         }
     }
 }
+
+/// How many bytes of `input` a PROXY header takes, by its framing alone;
+/// null when it does not start with a whole one.
+fn headerLen(input: []const u8) ?usize {
+    if (input.len >= 16 and std.mem.startsWith(u8, input, v2_signature)) {
+        const len = v2BodyLen(input[0..16]) catch return null;
+        return if (input.len >= 16 + @as(usize, len)) 16 + @as(usize, len) else null;
+    }
+    if (!std.mem.startsWith(u8, input, "PROXY ")) return null;
+    const end = std.mem.indexOfPos(u8, input, 12, "\r\n") orelse return null;
+    return if (end + 2 <= v1_max_len) end + 2 else null;
+}
+
+fn sameAddress(a: ?IpAddress, b: ?IpAddress) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return a.?.eql(&b.?);
+}
+
+test "fuzz: PROXY protocol headers, parsed and read off a socket" {
+    try @import("fuzz.zig").bytes(struct {
+        fn check(input: []const u8) !void {
+            if (parseV1(input)) |h| {
+                // A line that parses says the same once written back out.
+                if (h.source) |src| {
+                    var buf: [v1_max_len + 32]u8 = undefined;
+                    const line = try std.fmt.bufPrint(&buf, "PROXY {s} {f} {f} {d} {d}\r\n", .{
+                        if (src == .ip6) "TCP6" else "TCP4",
+                        Host{ .address = src },
+                        Host{ .address = h.destination.? },
+                        src.getPort(),
+                        h.destination.?.getPort(),
+                    });
+                    const again = try parseV1(line);
+                    try std.testing.expect(sameAddress(h.source, again.source));
+                    try std.testing.expect(sameAddress(h.destination, again.destination));
+                }
+            } else |_| {}
+
+            if (input.len >= 16) {
+                const head: *const [16]u8 = input[0..16];
+                if (parseV2(head, input[16..], true)) |h| {
+                    // Keeping only a prefix of the body never loses the
+                    // addresses of a header that parses whole.
+                    const address_len: usize = switch (head[13] >> 4) {
+                        af_inet => 12,
+                        af_inet6 => 36,
+                        af_unix => 216,
+                        else => 0,
+                    };
+                    var kept = address_len;
+                    while (kept <= input.len - 16) : (kept += 7) {
+                        const cut = try parseV2(head, input[16..][0..kept], false);
+                        try std.testing.expect(sameAddress(h.source, cut.source));
+                        try std.testing.expect(sameAddress(h.destination, cut.destination));
+                    }
+                } else |_| {}
+                _ = parseV2(head, input[16..], false) catch {};
+            }
+
+            // `read` takes exactly the header off the socket, and says
+            // what parsing it says.
+            var fds: [2]std.c.fd_t = undefined;
+            if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &fds) != 0) return error.SocketPair;
+            defer _ = std.c.close(fds[0]);
+            {
+                defer _ = std.c.close(fds[1]);
+                var written: usize = 0;
+                while (written < input.len) {
+                    const n = std.c.write(fds[1], input[written..].ptr, input.len - written);
+                    if (n <= 0) return error.WriteFailed;
+                    written += @intCast(n);
+                }
+            }
+            const io = std.testing.io;
+            const stream: std.Io.net.Stream = .{ .socket = .{ .handle = fds[0], .address = .{ .ip4 = .loopback(0) } } };
+            const result = read(io, stream);
+            const len = headerLen(input) orelse {
+                if (result) |_| return error.TestUnexpectedResult else |_| return;
+            };
+            const parsed: Error!Header = if (len >= 16 and std.mem.startsWith(u8, input, v2_signature))
+                parseV2(input[0..16], input[16..len][0..@min(len - 16, v2_body_kept)], len - 16 <= v2_body_kept)
+            else
+                parseV1(input[0..len]);
+            const want = parsed catch {
+                // The connection is refused; how much of it was read no
+                // longer matters.
+                if (result) |_| return error.TestUnexpectedResult else |_| return;
+            };
+            const got = try result;
+            try std.testing.expect(sameAddress(want.source, got.source));
+            try std.testing.expect(sameAddress(want.destination, got.destination));
+            try std.testing.expectEqual(want.ssl, got.ssl);
+            var rest: [fuzz_max]u8 = undefined;
+            var got_rest: usize = 0;
+            while (true) {
+                const n = std.c.read(fds[0], rest[got_rest..].ptr, rest.len - got_rest);
+                if (n <= 0) break;
+                got_rest += @intCast(n);
+            }
+            try std.testing.expectEqualSlices(u8, input[len..], rest[0..got_rest]);
+        }
+    }.check, &.{
+        "PROXY TCP4 192.0.2.1 198.51.100.2 56324 443\r\nGET / HTTP/1.1\r\n\r\n",
+        "PROXY TCP6 2001:db8::1 2001:db8::2 4000 80\r\n\x16\x03\x01",
+        "PROXY UNKNOWN ffff::1 ffff::2 1 2\r\n",
+        "PROXY TCP4 10.0.0.1 10.0.0.2 080 443\r\n",
+        v2_signature ++ "\x21\x11\x00\x13" ++ "\x0a\x00\x00\x01\x0a\x00\x00\x02\x00\x50\x00\x51" ++ "\x20\x00\x05\x01\x00\x00\x00\x00" ++ "\x00" ++ "after",
+        v2_signature ++ "\x21\x21\x00\x24" ++ "\x20\x01\x0d\xb8" ++ "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00" ++ "\x01" ++ "\x20\x01\x0d\xb8" ++ "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00" ++ "\x02" ++ "\x01\xbb\x00\x50",
+        v2_signature ++ "\x20\x00\x00\x00",
+        v2_signature ++ "\x21\x11\x00\x13" ++ "\x0a\x00\x00\x01\x0a\x00\x00\x02\x00\x50\x00\x51" ++ "\x03\x00\x04\x00\x00\x00\x00",
+    });
+}
+
+const fuzz_max = @import("fuzz.zig").max_len;
+
+/// An address without its port, as a v1 line spells it.
+const Host = struct {
+    address: IpAddress,
+    pub fn format(self: Host, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        switch (self.address) {
+            .ip4 => |a| try w.print("{d}.{d}.{d}.{d}", .{ a.bytes[0], a.bytes[1], a.bytes[2], a.bytes[3] }),
+            .ip6 => |a| for (0..8) |i| {
+                if (i > 0) try w.writeByte(':');
+                try w.print("{x}", .{std.mem.readInt(u16, a.bytes[i * 2 ..][0..2], .big)});
+            },
+        }
+    }
+};
