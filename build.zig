@@ -20,6 +20,11 @@ pub fn build(b: *std.Build) void {
         "Compile Dusty's vendored nghttp2; disable to inject a compatible 'nghttp2' module",
     ) orelse true;
     const use_zlib = b.option(bool, "use_zlib", "Build with gzip/deflate support via zlib.zig") orelse true;
+    const use_bundled_zlib = b.option(
+        bool,
+        "use_bundled_zlib",
+        "Use Dusty's pinned zlib.zig; disable to inject a compatible 'zlib' module",
+    ) orelse true;
 
     const mod = b.addModule("dusty", .{
         .root_source_file = b.path("src/root.zig"),
@@ -66,7 +71,13 @@ pub fn build(b: *std.Build) void {
     // lazy dependency, like TLS: only fetched when `use_zlib` is set (the
     // default). When disabled, a stub is imported so everything still builds,
     // and a coded body is refused with error.UnsupportedContentEncoding.
-    if (use_zlib) {
+    if (use_zlib and !use_bundled_zlib) {
+        // An application that builds its own zlib (zlib-ng, say) injects a
+        // module with zlib.zig's API: dusty_mod.addImport("zlib", its_module).
+        mod.addAnonymousImport("zlib", .{
+            .root_source_file = b.path("src/zlib_injection_required.zig"),
+        });
+    } else if (use_zlib) {
         if (b.lazyDependency("zlib", .{
             .target = target,
             .optimize = optimize,
