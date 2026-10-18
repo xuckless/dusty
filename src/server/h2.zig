@@ -65,6 +65,12 @@ pub fn sniffPreface(r: *std.Io.Reader) error{ReadFailed}!bool {
     }
 }
 
+/// Spare streams a connection keeps for reuse.
+const max_spare_streams = 16;
+/// What a reused stream's arena keeps between requests: the queues and
+/// buffers of an ordinary request with a body fit.
+const arena_retain_limit = 128 * 1024;
+
 /// Response body bytes queued per stream between the handler and the data
 /// provider; a handler that gets this far ahead of the peer waits.
 const out_queue_len = 32 * 1024;
@@ -91,6 +97,9 @@ pub fn Engine(comptime Ctx: type) type {
             mutex: std.Io.Mutex = .init,
             session: ?*c.nghttp2_session = null,
             streams: std.AutoHashMapUnmanaged(i32, *Stream) = .empty,
+            /// Finished streams kept for reuse with their arenas, so a
+            /// connection's requests stop allocating once it is warm.
+            spare_streams: std.ArrayList(*Stream) = .empty,
             /// Streams with a handler still running or a response still
             /// going out, each counted in the server's in-flight requests.
             open_streams: usize = 0,
@@ -167,7 +176,8 @@ pub fn Engine(comptime Ctx: type) type {
         const Stream = struct {
             conn: *Conn,
             id: i32,
-            /// Everything of the stream's lives here, the Stream included.
+            /// Everything of the request's lives here; reset, keeping what
+            /// it grew to, when the stream is reused.
             arena: std.heap.ArenaAllocator,
 
             // The request head, filled by the header callbacks before the
@@ -216,12 +226,25 @@ pub fn Engine(comptime Ctx: type) type {
 
             const Field = struct { name: []const u8, value: []const u8 };
 
+            /// A stream from the connection's spares (its arena reset, with
+            /// what it grew to kept), or a new one. Under the mutex.
             fn create(conn: *Conn, id: i32) !*Stream {
-                var arena: std.heap.ArenaAllocator = .init(conn.allocator);
-                errdefer arena.deinit();
-                const stream = try arena.allocator().create(Stream);
-                stream.* = .{ .conn = conn, .id = id, .arena = arena };
+                if (conn.spare_streams.pop()) |stream| {
+                    var arena = stream.arena;
+                    _ = arena.reset(.{ .retain_with_limit = arena_retain_limit });
+                    stream.* = .{ .conn = conn, .id = id, .arena = arena };
+                    return stream;
+                }
+                const stream = try conn.allocator.create(Stream);
+                stream.* = .{ .conn = conn, .id = id, .arena = .init(conn.allocator) };
                 return stream;
+            }
+
+            /// Frees the stream and its arena for good.
+            fn destroy(stream: *Stream, allocator: std.mem.Allocator) void {
+                var arena = stream.arena;
+                arena.deinit();
+                allocator.destroy(stream);
             }
 
             /// Drops one side's hold, under the mutex. The second frees it.
@@ -237,8 +260,10 @@ pub fn Engine(comptime Ctx: type) type {
                     conn.open_streams -= 1;
                     conn.server.finishRequest();
                 }
-                var arena = stream.arena;
-                arena.deinit();
+                if (conn.spare_streams.items.len < max_spare_streams) {
+                    if (conn.spare_streams.append(conn.allocator, stream)) |_| return else |_| {}
+                }
+                stream.destroy(conn.allocator);
             }
 
             /// No more request body: the stream ended or was reset.
@@ -294,6 +319,8 @@ pub fn Engine(comptime Ctx: type) type {
                     stream.release(.protocol);
                 }
                 conn.streams.deinit(conn.allocator);
+                for (conn.spare_streams.items) |stream| stream.destroy(conn.allocator);
+                conn.spare_streams.deinit(conn.allocator);
                 c.nghttp2_session_del(conn.session);
                 conn.session = null;
             }
@@ -910,8 +937,7 @@ pub fn Engine(comptime Ctx: type) type {
 
             const stream = Stream.create(conn, id) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
             conn.streams.put(conn.allocator, id, stream) catch {
-                var arena = stream.arena;
-                arena.deinit();
+                stream.destroy(conn.allocator);
                 return c.NGHTTP2_ERR_CALLBACK_FAILURE;
             };
             _ = c.nghttp2_session_set_stream_user_data(session, id, stream);
