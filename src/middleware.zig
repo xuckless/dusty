@@ -5,7 +5,8 @@ const http = @import("http.zig");
 const Action = @import("router.zig").Action;
 const Connection = @import("server.zig").Connection;
 
-const log = std.log.scoped(.dusty);
+const log = std.log.scoped(.anole);
+const ErrorHandler = @import("config.zig").ErrorHandler;
 
 /// Configuration passed to middleware init functions that accept 2 parameters.
 /// Provides access to allocators for middlewares that need dynamic allocation.
@@ -76,6 +77,9 @@ pub fn Executor(comptime Ctx: type) type {
         /// have one for its path (`Router.allowedMethods`): the miss is a
         /// 405 with this `Allow` rather than a 404.
         allow: ?[]const u8 = null,
+        /// `ServerConfig.error_handler`, for an app whose context has no
+        /// `uncaughtError`.
+        error_handler: ?ErrorHandler = null,
 
         pub fn run(self: *Self) !void {
             self.next() catch |err| switch (err) {
@@ -106,13 +110,15 @@ pub fn Executor(comptime Ctx: type) type {
                         log.err("unhandled error after response headers were sent: {} ({f} {s})", .{ err, self.req.method, self.req.url });
                         return err;
                     }
-                    if (clientError(err) != null) {
-                        // The request's fault, answered with a 4xx below.
+                    self.handleError(err);
+                    // By what it was answered with, which an `uncaughtError`
+                    // or `error_handler` may have chosen: a 4xx is the
+                    // request's fault, a 5xx the server's.
+                    if (@backingInt(self.res.status) < 500) {
                         log.debug("request rejected: {} ({f} {s})", .{ err, self.req.method, self.req.url });
                     } else {
                         log.err("unhandled error in request handler: {} ({f} {s})", .{ err, self.req.method, self.req.url });
                     }
-                    self.handleError(err);
                 },
             };
         }
@@ -149,9 +155,7 @@ pub fn Executor(comptime Ctx: type) type {
             if (comptime Ctx != void and @hasDecl(Ctx, "methodNotAllowed")) {
                 try self.ctx.methodNotAllowed(self.req, self.res);
             } else {
-                self.res.status = .method_not_allowed;
-                self.res.content_type = .text;
-                self.res.body = "405 Method Not Allowed\n";
+                self.res.fail(.method_not_allowed, "");
             }
         }
 
@@ -165,9 +169,7 @@ pub fn Executor(comptime Ctx: type) type {
             if (comptime Ctx != void and @hasDecl(Ctx, "notFound")) {
                 try self.ctx.notFound(self.req, self.res);
             } else {
-                self.res.status = .not_found;
-                self.res.content_type = .text;
-                self.res.body = "404 Not Found\n";
+                self.res.fail(.not_found, "");
             }
         }
 
@@ -179,46 +181,156 @@ pub fn Executor(comptime Ctx: type) type {
             self.res.resetBody();
             if (comptime Ctx != void and @hasDecl(Ctx, "uncaughtError")) {
                 self.ctx.uncaughtError(self.req, self.res, err);
-            } else if (clientError(err)) |answer| {
-                self.res.status = answer.status;
-                self.res.content_type = .text;
-                self.res.body = answer.body;
+            } else if (self.error_handler) |handler| {
+                handler(self.req, self.res, err);
             } else {
-                self.res.status = .internal_server_error;
-                self.res.content_type = .text;
-                self.res.body = "500 Internal Server Error\n";
+                defaultError(self.req, self.res, err);
             }
         }
     };
 }
 
-/// The 4xx for an error that is the request's doing rather than the
-/// handler's: a body over `max_body_size`, a content coding that cannot be
-/// undone, a JSON body that does not parse or fit. Null for anything else.
-pub fn clientError(err: anyerror) ?struct { status: http.Status, body: []const u8 } {
+/// What an error stands for when no `uncaughtError` or `error_handler`
+/// answers it: a status, and the body the default answer sends.
+pub const ErrorAnswer = struct { status: http.Status, body: []const u8 };
+
+/// The status an error stands for, or null for any other error (a 500).
+///
+/// - An error named after a status, as its tag (`NotFound`, `Unauthorized`,
+///   `TooManyRequests`, `ServiceUnavailable`) or its RFC 9110 reason
+///   phrase (`ContentTooLarge`, `UnprocessableContent`), means that status:
+///   a handler or middleware returns `error.Unauthorized` for a 401. Only
+///   the standard 4xx and 5xx codes count.
+/// - The request faults this server's own helpers return: `BodyTooBig`
+///   (413), `UnsupportedContentEncoding` (415), `InvalidJsonBody`,
+///   `MissingBody`, `InvalidZstd` and `IncompleteBody` (400).
+///
+/// Any other error is the server's: a `SyntaxError` from parsing something
+/// other than the request body is a 500, not a 400.
+pub fn errorStatus(err: anyerror) ?http.Status {
     return switch (err) {
-        error.BodyTooBig => .{ .status = .payload_too_large, .body = "413 Content Too Large\n" },
-        error.UnsupportedContentEncoding => .{ .status = .unsupported_media_type, .body = "415 Unsupported Media Type\n" },
-        error.InvalidZstd, error.IncompleteBody => .{ .status = .bad_request, .body = "400 Bad Request\n" },
-        error.SyntaxError,
-        error.UnexpectedEndOfInput,
-        error.UnexpectedToken,
-        error.InvalidNumber,
-        error.InvalidEnumTag,
-        error.DuplicateField,
-        error.UnknownField,
-        error.MissingField,
-        error.LengthMismatch,
-        => .{ .status = .bad_request, .body = "400 Bad Request\n" },
-        else => null,
+        error.BodyTooBig => .payload_too_large,
+        error.UnsupportedContentEncoding => .unsupported_media_type,
+        error.InvalidZstd, error.IncompleteBody, error.InvalidJsonBody, error.MissingBody => .bad_request,
+        else => status_errors.get(@errorName(err)),
     };
 }
 
-test "clientError: request faults map to 4xx, anything else to none" {
-    try std.testing.expectEqual(http.Status.payload_too_large, clientError(error.BodyTooBig).?.status);
-    try std.testing.expectEqual(http.Status.unsupported_media_type, clientError(error.UnsupportedContentEncoding).?.status);
-    try std.testing.expectEqual(http.Status.bad_request, clientError(error.SyntaxError).?.status);
-    try std.testing.expect(clientError(error.OutOfMemory) == null);
+/// `errorStatus` with the body the default answer sends in text form
+/// ("404 Not Found\n"). Null for an error that is a 500.
+pub fn clientError(err: anyerror) ?ErrorAnswer {
+    const status = errorStatus(err) orelse return null;
+    return .{ .status = status, .body = statusBody(status) };
+}
+
+/// Answers `err` as the server does when nothing else does: the status
+/// `errorStatus` gives it (else 500), with the status line's text as the
+/// body, or `{"error":"..."}` (see `ServerConfig.errors`). For an
+/// `uncaughtError` or `error_handler` that handles some errors itself and
+/// leaves the rest to this.
+pub fn defaultError(_: *Request, res: *Response, err: anyerror) void {
+    res.fail(errorStatus(err) orelse .internal_server_error, "");
+}
+
+/// The standard 4xx and 5xx codes, the ones an error can be named after.
+const standard_error_codes = [_]u16{
+    400, 401, 402, 403, 404, 405, 406, 407, 408, 409, 410, 411, 412, 413, 414, 415, 416, 417, 418,
+    421, 422, 423, 424, 425, 426, 428, 429, 431, 451, 500, 501, 502, 503, 504, 505, 506, 507, 508,
+    510, 511,
+};
+
+/// "not_found" or "Not Found" as "NotFound": each word capitalised, and
+/// anything but letters and digits left out.
+fn pascalCase(comptime text: []const u8) []const u8 {
+    comptime {
+        var out: [text.len]u8 = undefined;
+        var n = 0;
+        var start = true;
+        for (text) |ch| {
+            if (std.ascii.isAlphanumeric(ch)) {
+                out[n] = if (start) std.ascii.toUpper(ch) else ch;
+                n += 1;
+                start = false;
+            } else if (ch == '_' or ch == ' ' or ch == '-') {
+                start = true;
+            }
+        }
+        const final = out[0..n].*;
+        return &final;
+    }
+}
+
+const status_errors = blk: {
+    @setEvalBranchQuota(100_000);
+    var kvs: [standard_error_codes.len * 2]struct { []const u8, http.Status } = undefined;
+    var n = 0;
+    for (standard_error_codes) |code| {
+        const status: http.Status = @fromBackingInt(@intCast(code));
+        kvs[n] = .{ pascalCase(@tagName(status)), status };
+        n += 1;
+        const from_phrase = pascalCase(standardPhrase(code));
+        if (!std.mem.eql(u8, from_phrase, kvs[n - 1][0])) {
+            kvs[n] = .{ from_phrase, status };
+            n += 1;
+        }
+    }
+    break :blk std.StaticStringMap(http.Status).initComptime(kvs[0..n]);
+};
+
+/// `Status.phrase` for a standard code, at compile time (the fallback
+/// there asks llhttp, which compile time cannot).
+fn standardPhrase(comptime code: u16) []const u8 {
+    const status: http.Status = @fromBackingInt(@intCast(code));
+    return status.phrase();
+}
+
+const status_bodies = blk: {
+    @setEvalBranchQuota(100_000);
+    var bodies: [standard_error_codes.len][]const u8 = undefined;
+    for (standard_error_codes, &bodies) |code, *body| body.* = std.fmt.comptimePrint("{d} {s}\n", .{ code, standardPhrase(code) });
+    break :blk bodies;
+};
+
+/// "404 Not Found\n" for a standard 4xx or 5xx code; empty for another.
+pub fn statusBody(status: http.Status) []const u8 {
+    const code = @backingInt(status);
+    for (standard_error_codes, status_bodies) |c, body| if (c == code) return body;
+    return "";
+}
+
+test "errorStatus: status-named errors, body faults, and nothing else" {
+    try std.testing.expectEqual(http.Status.payload_too_large, errorStatus(error.BodyTooBig).?);
+    try std.testing.expectEqual(http.Status.unsupported_media_type, errorStatus(error.UnsupportedContentEncoding).?);
+    try std.testing.expectEqual(http.Status.bad_request, errorStatus(error.InvalidJsonBody).?);
+    try std.testing.expectEqual(http.Status.bad_request, errorStatus(error.MissingBody).?);
+    try std.testing.expectEqual(http.Status.unauthorized, errorStatus(error.Unauthorized).?);
+    try std.testing.expectEqual(http.Status.forbidden, errorStatus(error.Forbidden).?);
+    try std.testing.expectEqual(http.Status.not_found, errorStatus(error.NotFound).?);
+    try std.testing.expectEqual(http.Status.conflict, errorStatus(error.Conflict).?);
+    try std.testing.expectEqual(http.Status.too_many_requests, errorStatus(error.TooManyRequests).?);
+    try std.testing.expectEqual(http.Status.service_unavailable, errorStatus(error.ServiceUnavailable).?);
+    // By tag and by RFC 9110 phrase.
+    try std.testing.expectEqual(http.Status.unprocessable_entity, errorStatus(error.UnprocessableEntity).?);
+    try std.testing.expectEqual(http.Status.unprocessable_entity, errorStatus(error.UnprocessableContent).?);
+    try std.testing.expectEqual(http.Status.payload_too_large, errorStatus(error.ContentTooLarge).?);
+    try std.testing.expectEqual(http.Status.im_a_teapot, errorStatus(error.ImATeapot).?);
+    // A JSON error from parsing something other than the request body is
+    // the server's fault, and so is anything else unnamed.
+    try std.testing.expect(errorStatus(error.SyntaxError) == null);
+    try std.testing.expect(errorStatus(error.UnexpectedEndOfInput) == null);
+    try std.testing.expect(errorStatus(error.UnknownField) == null);
+    try std.testing.expect(errorStatus(error.OutOfMemory) == null);
+    // llhttp's non-standard codes are not error names: a library's
+    // `InvalidToken` is no 498.
+    try std.testing.expect(errorStatus(error.InvalidToken) == null);
+    try std.testing.expect(errorStatus(error.Ok) == null);
+}
+
+test "clientError: the default text body" {
+    try std.testing.expectEqualStrings("413 Content Too Large\n", clientError(error.BodyTooBig).?.body);
+    try std.testing.expectEqualStrings("401 Unauthorized\n", clientError(error.Unauthorized).?.body);
+    try std.testing.expectEqualStrings("503 Service Unavailable\n", clientError(error.ServiceUnavailable).?.body);
+    try std.testing.expect(clientError(error.SyntaxError) == null);
 }
 
 // Tests

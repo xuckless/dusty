@@ -351,6 +351,36 @@ pub fn Router(comptime Ctx: type) type {
         /// the miss path only, after `findHandler` came up empty; it
         /// leaves `req.params` empty.
         pub fn allowedMethods(self: *const Self, req: *Request) !?[]const u8 {
+            return self.methodMiss(req, null);
+        }
+
+        /// What a request no route matched runs: `allow` as
+        /// `allowedMethods` gives it, and the middleware to run before the
+        /// 404 or 405. That is the global middleware, except for an
+        /// OPTIONS request to a path with routes for other methods (a CORS
+        /// preflight), which runs the middleware of the route it asks
+        /// about (`Access-Control-Request-Method`), or else of one of them:
+        /// so a `Cors` middleware in a group answers the preflights for
+        /// the group's routes.
+        pub fn miss(self: *const Self, req: *Request) !Miss {
+            var route: ?*const Route = null;
+            const allow = try self.methodMiss(req, if (req.method == .options) &route else null);
+            return .{
+                .allow = allow,
+                .middlewares = if (route) |r| r.middlewares else self.middlewares,
+            };
+        }
+
+        pub const Miss = struct {
+            allow: ?[]const u8,
+            middlewares: []const Middleware(Ctx),
+        };
+
+        fn methodMiss(self: *const Self, req: *Request, preflight_route: ?*?*const Route) !?[]const u8 {
+            const wanted: ?Method = if (preflight_route != null)
+                (if (req.headers.get("Access-Control-Request-Method")) |m| methodNamed(m) else null)
+            else
+                null;
             const path = if (std.mem.indexOfScalar(u8, req.url, '?')) |q| req.url[0..q] else req.url;
             const max_segments = std.mem.count(u8, path, "/") + 1;
             const segments = try req.arena.alloc([]const u8, max_segments);
@@ -376,6 +406,9 @@ pub fn Router(comptime Ctx: type) type {
                 req.params.map.clearRetainingCapacity();
                 const route = self.matchIn(m, req, path, segments[0..n], offsets[0..n]) catch continue;
                 if (route == null) continue;
+                if (preflight_route) |out| {
+                    if (out.* == null or m == wanted) out.* = route;
+                }
                 if (m == .get) has_get = true;
                 if (m == .head) has_head = true;
                 if (allow.items.len > 0) try allow.appendSlice(req.arena, ", ");
@@ -384,6 +417,11 @@ pub fn Router(comptime Ctx: type) type {
             // A GET route answers HEAD too (see `findHandler`).
             if (has_get and !has_head and req.method != .head) try allow.appendSlice(req.arena, ", HEAD");
             return if (allow.items.len == 0) null else allow.items;
+        }
+
+        fn methodNamed(text: []const u8) ?Method {
+            for (std.enums.values(Method)) |m| if (std.mem.eql(u8, m.name(), text)) return m;
+            return null;
         }
 
         fn matchIn(

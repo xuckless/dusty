@@ -43,7 +43,7 @@ const Transport = @import("../transport.zig").Transport;
 const Timer = @import("../deadline.zig").Timer;
 const placement = @import("../placement.zig");
 
-const log = std.log.scoped(.dusty_h2);
+const log = std.log.scoped(.anole_h2);
 
 /// The client connection preface (RFC 9113 §3.4).
 pub const preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";

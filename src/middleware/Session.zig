@@ -5,7 +5,7 @@ const CookieOpts = @import("../cookie.zig").CookieOpts;
 
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 const base64url = std.base64.url_safe_no_pad;
-const log = std.log.scoped(.dusty);
+const log = std.log.scoped(.anole);
 
 pub const max_entries = 16;
 

@@ -13,6 +13,9 @@ const body_read_reserve = @import("config.zig").body_read_reserve;
 const Response = @import("response.zig").Response;
 pub const Cookie = @import("cookie.zig").Cookie;
 pub const SessionData = @import("middleware/Session.zig").SessionData;
+pub const Locals = @import("locals.zig").Locals;
+
+const log = std.log.scoped(.anole);
 
 const placeholder_listener: Listener = .{ .address = .{ .ip = .{ .ip4 = .unspecified(0) } } };
 
@@ -103,6 +106,9 @@ pub const Request = struct {
     _mfd: std.StringHashMapUnmanaged(MultipartForm.Entry) = .{},
     _mfd_read: bool = false,
     session: SessionData = .{},
+    /// Values a middleware hands to the handler for this request: see
+    /// `setLocal` and `local`.
+    locals: Locals = .{},
 
     // 100-continue support
     response: ?*Response = null,
@@ -263,26 +269,74 @@ pub const Request = struct {
         return result;
     }
 
-    /// Parse body as JSON into type T, with `std.json`. json.zig is
-    /// considerably faster for types known at compile time.
-    pub fn json(self: *Request, comptime T: type) !?T {
-        const b = try self.body() orelse return null;
-        return try std.json.parseFromSliceLeaky(T, self.arena, b, .{});
+    /// The JSON body as a `T` (`std.json`), allocated in the request's
+    /// arena: `const in = try req.bind(NewUser);`. Fields the body has and
+    /// `T` does not are ignored. A request without a body fails with
+    /// `error.MissingBody`, and one that is not JSON or does not fit `T`
+    /// (a missing field, a string for a number) with `error.InvalidJsonBody`;
+    /// the server answers both with 400. The `Content-Type` is not checked.
+    pub fn bind(self: *Request, comptime T: type) !T {
+        return self.bindWith(T, lenient_json);
     }
 
-    /// Parse body as a generic JSON value
+    /// `bind` with `std.json`'s parse options as given. Their default
+    /// refuses fields `T` lacks, which `bind` ignores.
+    pub fn bindWith(self: *Request, comptime T: type, options: std.json.ParseOptions) !T {
+        return try self.jsonWith(T, options) orelse error.MissingBody;
+    }
+
+    /// `bind`, with null for a request without a body.
+    pub fn json(self: *Request, comptime T: type) !?T {
+        return self.jsonWith(T, lenient_json);
+    }
+
+    const lenient_json: std.json.ParseOptions = .{ .ignore_unknown_fields = true };
+
+    fn jsonWith(self: *Request, comptime T: type, options: std.json.ParseOptions) !?T {
+        const b = try self.body() orelse return null;
+        return std.json.parseFromSliceLeaky(T, self.arena, b, options) catch |err| switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => {
+                log.debug("request body is not the JSON expected: {t}", .{err});
+                return error.InvalidJsonBody;
+            },
+        };
+    }
+
+    /// The JSON body as a generic value; null without a body, and
+    /// `error.InvalidJsonBody` (a 400) when it is not JSON.
     pub fn jsonValue(self: *Request) !?std.json.Value {
         const b = try self.body() orelse return null;
-        return try std.json.parseFromSliceLeaky(std.json.Value, self.arena, b, .{});
+        return std.json.parseFromSliceLeaky(std.json.Value, self.arena, b, .{}) catch |err| switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.InvalidJsonBody,
+        };
     }
 
-    /// Parse body as a JSON object
+    /// The JSON body as an object; null without a body or when it is some
+    /// other JSON value.
     pub fn jsonObject(self: *Request) !?std.json.ObjectMap {
         const value = try self.jsonValue() orelse return null;
         switch (value) {
             .object => |o| return o,
             else => return null,
         }
+    }
+
+    /// Stores `value` under `key` for the rest of this request, for a
+    /// handler or a later middleware to read with `local`: the way a
+    /// middleware hands what it found (a user, a tenant, verified claims)
+    /// to the handler. A copy of `value` lives in the request's arena;
+    /// `key` is not copied and must outlive the request (a literal). A
+    /// second value under the same key replaces the first.
+    pub fn setLocal(self: *Request, key: []const u8, value: anytype) !void {
+        return self.locals.put(self.arena, key, value);
+    }
+
+    /// The value stored under `key` with `setLocal`, if it was stored as a
+    /// `T`; null when there is none, or it is of another type.
+    pub fn local(self: *const Request, comptime T: type, key: []const u8) ?T {
+        return self.locals.get(T, key);
     }
 
     /// Get cookies from the request

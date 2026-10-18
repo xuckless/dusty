@@ -1,5 +1,24 @@
 const std = @import("std");
 const ContentType = @import("http.zig").ContentType;
+const HttpRequest = @import("request.zig").Request;
+const HttpResponse = @import("response.zig").Response;
+
+/// How the server's own error answers (a 404, a 500, `Response.fail`) are
+/// written. `ServerConfig.errors`.
+pub const ErrorFormat = enum {
+    /// `{"error":"..."}` for a request that says it takes JSON (an
+    /// `Accept` naming JSON, or a JSON body), plain text otherwise.
+    auto,
+    /// Always `{"error":"..."}`: an API server.
+    json,
+    /// Always plain text.
+    text,
+};
+
+/// Answers a request whose handler or middleware failed with `err`, in
+/// place of the default mapping (`ServerConfig.error_handler`). It can
+/// fall back to that mapping with `defaultError(req, res, err)`.
+pub const ErrorHandler = *const fn (req: *HttpRequest, res: *HttpResponse, err: anyerror) void;
 
 /// Where a TLS peer's certificate authorities are loaded from. Shared by the
 /// client (verifying server certificates) and the server (verifying client
@@ -167,6 +186,10 @@ pub const Listener = struct {
     /// to another. Linux only, and needs an IP address with
     /// `reuse_address` set.
     socket_per_acceptor: bool = false,
+    /// Protocols served on this address by something other than this
+    /// server, such as HTTP/3 on the UDP port of the same number, named
+    /// after its own in the line logged when it starts listening.
+    extra_protocols: []const []const u8 = &.{},
 
     /// The number of accept loops, with `cpu_count` standing in for the
     /// CPUs the process may use when `acceptors` is null.
@@ -238,6 +261,15 @@ pub const ServerConfig = struct {
     /// with a `Content-Encoding` takes 70K more while `request.decompress`
     /// is on.
     max_connections: ?u32 = 10_000,
+    /// How the server's own error answers are written: a 404, a 405, the
+    /// status an error maps to, `Response.fail`. See `ErrorFormat`.
+    errors: ErrorFormat = .auto,
+    /// Answers handler and middleware errors in place of the default
+    /// mapping (status-named errors such as `error.Unauthorized` to their
+    /// status, request-body faults to 4xx, the rest to 500), for an app
+    /// without a context of its own. A context's `uncaughtError` comes
+    /// first.
+    error_handler: ?ErrorHandler = null,
     /// TLS is per listener: see `Listener.tls`.
     pub const Tls = struct {
         /// Path to the PEM certificate (chain) file, resolved against `dir`.
