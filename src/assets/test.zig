@@ -59,7 +59,7 @@ test "assets: cached for good at the current version, revalidated at any other" 
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
-    try server.ready.wait(io);
+    try server.waitReady(io);
 
     var out: [4096]u8 = undefined;
     const hashed = try get(&server, assets.url("img/logo.svg"), "", &out);

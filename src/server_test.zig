@@ -22,7 +22,7 @@ fn testClientServer(comptime Ctx: type, ctx: *Ctx) !void {
 
     var client_future = try io.concurrent(struct {
         fn run(s: *TestServer, test_ctx: *Ctx, _io: std.Io) !void {
-            try s.ready.wait(_io);
+            try s.waitReady(_io);
 
             const stream = try s.address.ip.connect(_io, .{ .mode = .stream });
             defer stream.close(_io);
@@ -295,7 +295,7 @@ test "Server: a streamed body to an HTTP/1.0 client is not chunked" {
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
 
-    try server.ready.wait(io);
+    try server.waitReady(io);
 
     const stream = try server.address.ip.connect(io, .{ .mode = .stream });
     defer stream.close(io);
@@ -374,7 +374,7 @@ test "Server: WebSocket echo" {
 
     var client_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(TestContext), _io: std.Io) !void {
-            try s.ready.wait(_io);
+            try s.waitReady(_io);
 
             const stream = try s.address.ip.connect(_io, .{ .mode = .stream });
             defer stream.close(_io);
@@ -513,7 +513,7 @@ test "Server: void context handlers" {
 
     var client_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void), _io: std.Io) !void {
-            try s.ready.wait(_io);
+            try s.waitReady(_io);
 
             const stream = try s.address.ip.connect(_io, .{ .mode = .stream });
             defer stream.close(_io);
@@ -577,7 +577,7 @@ test "Server: graceful shutdown drain still blocks after an earlier connection c
     // consumes the future; it only matters if the test fails early.
     defer server_future.cancel(io) catch {};
 
-    try server.ready.wait(io);
+    try server.waitReady(io);
 
     // A connection closes before shutdown begins.
     {
@@ -646,7 +646,7 @@ test "Server: 100-continue" {
 
     var client_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void), _io: std.Io) !void {
-            try s.ready.wait(_io);
+            try s.waitReady(_io);
 
             const stream = try s.address.ip.connect(_io, .{ .mode = .stream });
             defer stream.close(_io);
@@ -703,7 +703,7 @@ test "Server: no 100 Continue once the response has started" {
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
 
-    try server.ready.wait(io);
+    try server.waitReady(io);
 
     const stream = try server.address.ip.connect(io, .{ .mode = .stream });
     defer stream.close(io);
@@ -785,7 +785,7 @@ test "Server: keepalive after handler ignores request body" {
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
 
-    try server.ready.wait(io);
+    try server.waitReady(io);
 
     const stream = try server.address.ip.connect(io, .{ .mode = .stream });
     defer stream.close(io);
@@ -846,7 +846,7 @@ test "Server: keepalive with request buffers given back between requests" {
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
 
-    try server.ready.wait(io);
+    try server.waitReady(io);
 
     const stream = try server.address.ip.connect(io, .{ .mode = .stream });
     defer stream.close(io);
@@ -922,7 +922,7 @@ fn expectPipelinedResponses(
     }.run, .{server});
     defer server_future.cancel(io) catch {};
 
-    try server.ready.wait(io);
+    try server.waitReady(io);
 
     const stream = try server.address.ip.connect(io, .{ .mode = .stream });
     defer stream.close(io);
@@ -1026,7 +1026,7 @@ test "Server: a pipelined head that arrives in two parts is served" {
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
 
-    try server.ready.wait(io);
+    try server.waitReady(io);
 
     const stream = try server.address.ip.connect(io, .{ .mode = .stream });
     defer stream.close(io);
@@ -1073,7 +1073,7 @@ test "Server: Connection: close on a pipelined request ends the connection after
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
 
-    try server.ready.wait(io);
+    try server.waitReady(io);
 
     const stream = try server.address.ip.connect(io, .{ .mode = .stream });
     defer stream.close(io);
@@ -1113,7 +1113,7 @@ test "Server: a CONNECT ends the connection, its body unserved" {
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
 
-    try server.ready.wait(io);
+    try server.waitReady(io);
 
     const stream = try server.address.ip.connect(io, .{ .mode = .stream });
     defer stream.close(io);
@@ -1171,7 +1171,7 @@ test "Server: a handler's own EndOfStream is a 500, not a vanished peer" {
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
 
-    try server.ready.wait(io);
+    try server.waitReady(io);
 
     const stream = try server.address.ip.connect(io, .{ .mode = .stream });
     defer stream.close(io);
@@ -1230,7 +1230,7 @@ test "Server: handler error yields 500 and keeps the connection alive" {
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
 
-    try server.ready.wait(io);
+    try server.waitReady(io);
 
     const stream = try server.address.ip.connect(io, .{ .mode = .stream });
     defer stream.close(io);
@@ -1295,7 +1295,7 @@ test "Server: an event stream is chunked and leaves the connection reusable" {
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
 
-    try server.ready.wait(io);
+    try server.waitReady(io);
 
     const stream = try server.address.ip.connect(io, .{ .mode = .stream });
     defer stream.close(io);
@@ -1374,7 +1374,7 @@ test "Server: handler error after streaming started aborts the connection" {
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
 
-    try server.ready.wait(io);
+    try server.waitReady(io);
 
     const stream = try server.address.ip.connect(io, .{ .mode = .stream });
     defer stream.close(io);
@@ -1447,7 +1447,7 @@ test "Server: keepalive after handler ignores a compressed request body" {
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
 
-    try server.ready.wait(io);
+    try server.waitReady(io);
 
     const stream = try server.address.ip.connect(io, .{ .mode = .stream });
     defer stream.close(io);
@@ -1513,7 +1513,7 @@ test "Server: closes connection when unread body exceeds max_body_size" {
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
 
-    try server.ready.wait(io);
+    try server.waitReady(io);
 
     const stream = try server.address.ip.connect(io, .{ .mode = .stream });
     defer stream.close(io);
@@ -1568,7 +1568,7 @@ test "Server: 417 Expectation Failed for unknown Expect value" {
 
     var client_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void), _io: std.Io) !void {
-            try s.ready.wait(_io);
+            try s.waitReady(_io);
 
             const stream = try s.address.ip.connect(_io, .{ .mode = .stream });
             defer stream.close(_io);
@@ -1614,7 +1614,7 @@ fn statusLineFor(raw: []const u8, out: []u8) ![]const u8 {
 
     var client_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void), _io: std.Io, request: []const u8, status_out: []u8) ![]const u8 {
-            try s.ready.wait(_io);
+            try s.waitReady(_io);
 
             const stream = try s.address.ip.connect(_io, .{ .mode = .stream });
             defer stream.close(_io);
@@ -1672,7 +1672,7 @@ fn statusLineWithUnreadBody(head: []const u8, body_len: usize, chunked: bool, ti
 
     var client_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void), _io: std.Io, request_head: []const u8, len: usize, is_chunked: bool, status_out: []u8) ![]const u8 {
-            try s.ready.wait(_io);
+            try s.waitReady(_io);
 
             const stream = try s.address.ip.connect(_io, .{ .mode = .stream });
             defer stream.close(_io);
@@ -1793,7 +1793,7 @@ test "Server: a body sent without waiting for 100 Continue is drained and the co
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
 
-    try server.ready.wait(io);
+    try server.waitReady(io);
 
     const stream = try server.address.ip.connect(io, .{ .mode = .stream });
     defer stream.close(io);
@@ -1850,7 +1850,7 @@ test "Server: HEAD is answered by the GET route with no body" {
 
     var client_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void), _io: std.Io) !void {
-            try s.ready.wait(_io);
+            try s.waitReady(_io);
             const stream = try s.address.ip.connect(_io, .{ .mode = .stream });
             defer stream.close(_io);
             defer stream.shutdown(_io, .both) catch {};
@@ -1914,7 +1914,7 @@ test "Server: graceful shutdown waits for a connection that finishes in time" {
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
 
-    try server.ready.wait(io);
+    try server.waitReady(io);
 
     const stream = try server.address.ip.connect(io, .{ .mode = .stream });
     defer stream.close(io);
@@ -1962,7 +1962,7 @@ fn expectIdleConnectionsClosedOnShutdown(timeout: dusty.ServerConfig.Timeout) !v
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
 
-    try server.ready.wait(io);
+    try server.waitReady(io);
 
     // One connection idle after a request, one that never sent any.
     const used = try server.address.ip.connect(io, .{ .mode = .stream });
@@ -2033,7 +2033,7 @@ test "Server: a request arriving during the shutdown drain is refused, not serve
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
 
-    try server.ready.wait(io);
+    try server.waitReady(io);
 
     const slow = try server.address.ip.connect(io, .{ .mode = .stream });
     defer slow.close(io);
@@ -2165,7 +2165,7 @@ test "Server: request resolves the client through a trusted proxy" {
 
     var client_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(Ctx), _io: std.Io) !void {
-            try s.ready.wait(_io);
+            try s.waitReady(_io);
 
             const stream = try s.address.ip.connect(_io, .{ .mode = .stream });
             defer stream.close(_io);
@@ -2274,7 +2274,7 @@ test "Server: run serves every listener and tells the handler which one" {
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
 
-    try server.ready.wait(io);
+    try server.waitReady(io);
     try std.testing.expectEqual(2, server.addresses.len);
     try std.testing.expect(server.addresses[0].ip.getPort() != server.addresses[1].ip.getPort());
     try std.testing.expectEqual(server.addresses[0].ip.getPort(), server.address.ip.getPort());
@@ -2325,7 +2325,7 @@ test "Server: socket_per_acceptor binds every socket to one port and serves them
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
 
-    try server.ready.wait(io);
+    try server.waitReady(io);
     try std.testing.expectEqual(1, server.addresses.len);
     try std.testing.expect(server.address.ip.getPort() != 0);
 
@@ -2402,6 +2402,29 @@ test "Server: a listener that fails to open releases the ones opened before it" 
     again.deinit(io);
 }
 
+test "Server: a task waiting for the server to listen is told when it never will" {
+    if (!@import("build_options").use_tls) return error.SkipZigTest;
+    const io = std.testing.io;
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .listeners = &.{.{
+            .address = loopback_addr,
+            .tls = .{ .cert_path = "examples/certs/missing.pem", .key_path = "examples/certs/key.pem" },
+        }},
+    }, {});
+    defer server.deinit();
+
+    var waiter = try io.concurrent(struct {
+        fn wait(s: *dusty.Server(void), _io: std.Io) anyerror!void {
+            try s.waitReady(_io);
+        }
+    }.wait, .{ &server, io });
+    defer waiter.cancel(io) catch {};
+    try std.testing.expectError(error.FileNotFound, server.run());
+    try std.testing.expectError(error.FileNotFound, waiter.await(io));
+    // `ready` still means listening, which it never was.
+    try std.testing.expect(!server.ready.isSet());
+}
+
 test "Server: a listener with tls set is refused when TLS is compiled out" {
     if (@import("build_options").use_tls) return error.SkipZigTest;
     const io = std.testing.io;
@@ -2449,7 +2472,7 @@ test "Server: graceful shutdown waits for a request in flight on a later listene
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
 
-    try server.ready.wait(io);
+    try server.waitReady(io);
 
     const stream = try server.addresses[1].ip.connect(io, .{ .mode = .stream });
     defer stream.close(io);
@@ -2496,7 +2519,7 @@ test "Server: a request head too large for the buffer gets 431, not a panic" {
 
     var client_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void), _io: std.Io) !void {
-            try s.ready.wait(_io);
+            try s.waitReady(_io);
 
             const stream = try s.address.ip.connect(_io, .{ .mode = .stream });
             defer stream.close(_io);
@@ -2548,7 +2571,7 @@ test "Server: a peer that will not hang up after a 431 is hung up on anyway" {
 
     var client_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void), _io: std.Io) !void {
-            try s.ready.wait(_io);
+            try s.waitReady(_io);
 
             const stream = try s.address.ip.connect(_io, .{ .mode = .stream });
             defer stream.close(_io);
@@ -2610,7 +2633,7 @@ test "Server: a head that just fits is still served" {
 
     var client_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void), _io: std.Io) !void {
-            try s.ready.wait(_io);
+            try s.waitReady(_io);
 
             const stream = try s.address.ip.connect(_io, .{ .mode = .stream });
             defer stream.close(_io);
@@ -2677,7 +2700,7 @@ fn expectStatusForHeadOfLength(
 
     var client_future = try io.concurrent(struct {
         fn run(s: *S, len: usize, want: []const u8, _io: std.Io) !void {
-            try s.ready.wait(_io);
+            try s.waitReady(_io);
             const stream = try s.address.ip.connect(_io, .{ .mode = .stream });
             defer stream.close(_io);
 
@@ -2769,7 +2792,7 @@ test "Server: max_connections caps overlap without dropping anyone" {
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
 
-    try server.ready.wait(io);
+    try server.waitReady(io);
 
     const One = struct {
         fn run(s: *S, _io: std.Io) !void {
@@ -2826,7 +2849,7 @@ test "Server: a slot freed on one listener reaches a connection waiting on anoth
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
 
-    try server.ready.wait(io);
+    try server.waitReady(io);
 
     const Get = struct {
         fn run(address: dusty.Address, _io: std.Io, served: *std.atomic.Value(bool), hold: ?*std.Io.Event) !void {
@@ -2907,7 +2930,7 @@ fn millisUntilServerHangsUp(config: dusty.ServerConfig, head: []const u8) !?i64 
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
 
-    try server.ready.wait(io);
+    try server.waitReady(io);
 
     const stream = try server.address.ip.connect(io, .{ .mode = .stream });
     defer stream.close(io);
@@ -2965,7 +2988,7 @@ test "Server: an idle keepalive connection is cut off by timeout.keepalive" {
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
 
-    try server.ready.wait(io);
+    try server.waitReady(io);
 
     const stream = try server.address.ip.connect(io, .{ .mode = .stream });
     defer stream.close(io);
@@ -3102,7 +3125,7 @@ test "Server: responses carry a Date header, RFC reason phrases and a default Co
         }
     }.run, .{&server});
     defer future.cancel(io) catch {};
-    try server.ready.wait(io);
+    try server.waitReady(io);
 
     var buf: [1024]u8 = undefined;
     const plain = try rawHead(io, &server, "GET /plain HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", &buf);
@@ -3140,7 +3163,7 @@ test "Server: a body over max_body_size is 413, a declared one over max_content_
         }
     }.run, .{&server});
     defer future.cancel(io) catch {};
-    try server.ready.wait(io);
+    try server.waitReady(io);
 
     var buf: [1024]u8 = undefined;
     const too_big = try rawHead(io, &server, "POST /buffer HTTP/1.1\r\nHost: x\r\nContent-Length: 20\r\nConnection: close\r\n\r\n01234567890123456789", &buf);
@@ -3169,7 +3192,7 @@ test "Server: a head that does not arrive within read_header closes the connecti
         }
     }.run, .{&server});
     defer future.cancel(io) catch {};
-    try server.ready.wait(io);
+    try server.waitReady(io);
 
     { // Slowloris: half a head, then nothing.
         const stream = try server.address.ip.connect(io, .{ .mode = .stream });
@@ -3222,7 +3245,7 @@ test "Server: a zstd request body is refused with 415 when built without zstd" {
         }
     }.run, .{&server});
     defer future.cancel(io) catch {};
-    try server.ready.wait(io);
+    try server.waitReady(io);
 
     var buf: [1024]u8 = undefined;
     const head = try rawHead(io, &server, "POST /body HTTP/1.1\r\nHost: x\r\nContent-Encoding: zstd\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabc", &buf);
@@ -3255,7 +3278,7 @@ test "Server: the Compress middleware gzips text and leaves images alone" {
         }
     }.run, .{&server});
     defer future.cancel(io) catch {};
-    try server.ready.wait(io);
+    try server.waitReady(io);
 
     var buf: [4096]u8 = undefined;
     const text = try rawHead(io, &server, "GET /text HTTP/1.1\r\nHost: x\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n", &buf);
@@ -3311,7 +3334,7 @@ test "Server: router.use with RequestId and Logger, and nested groups" {
         }
     }.run, .{&server});
     defer future.cancel(io) catch {};
-    try server.ready.wait(io);
+    try server.waitReady(io);
 
     const stream = try server.address.ip.connect(io, .{ .mode = .stream });
     defer stream.close(io);
@@ -3373,7 +3396,7 @@ test "Server: a PROXY protocol listener takes the client address from v1 and v2 
         }
     }.run, .{&server});
     defer future.cancel(io) catch {};
-    try server.ready.wait(io);
+    try server.waitReady(io);
 
     var out: [2048]u8 = undefined;
     const v1 = try rawAll(io, &server, "PROXY TCP4 192.0.2.7 198.51.100.2 56324 443\r\nGET /who HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n", &out);
@@ -3419,7 +3442,7 @@ test "Server: X-Forwarded-Proto and X-Forwarded-Host from a trusted proxy" {
         }
     }.run, .{&server});
     defer future.cancel(io) catch {};
-    try server.ready.wait(io);
+    try server.waitReady(io);
 
     var out: [2048]u8 = undefined;
     const resp = try rawAll(io, &server, "GET /who HTTP/1.1\r\nHost: internal:8080\r\nX-Forwarded-For: 203.0.113.9\r\nX-Forwarded-Proto: http, https\r\nX-Forwarded-Host: shop.example.com\r\nConnection: close\r\n\r\n", &out);
@@ -3441,7 +3464,7 @@ test "Server: forwarding headers are ignored without trusted hops" {
         }
     }.run, .{&server});
     defer future.cancel(io) catch {};
-    try server.ready.wait(io);
+    try server.waitReady(io);
 
     var out: [2048]u8 = undefined;
     const resp = try rawAll(io, &server, "GET /who HTTP/1.1\r\nHost: internal:8080\r\nX-Forwarded-For: 203.0.113.9\r\nX-Forwarded-Proto: https\r\nX-Forwarded-Host: shop.example.com\r\nConnection: close\r\n\r\n", &out);
@@ -3466,7 +3489,7 @@ test "Server: a path with routes for other methods answers 405 with Allow" {
         }
     }.run, .{&server});
     defer future.cancel(io) catch {};
-    try server.ready.wait(io);
+    try server.waitReady(io);
 
     var buf: [1024]u8 = undefined;
     const head = try rawHead(io, &server, "POST /items/7 HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", &buf);
@@ -3495,7 +3518,7 @@ test "Server: compression follows the client's q-values over the server's prefer
         }
     }.run, .{&server});
     defer future.cancel(io) catch {};
-    try server.ready.wait(io);
+    try server.waitReady(io);
 
     var buf: [4096]u8 = undefined;
     const head = try rawHead(io, &server, "GET /text HTTP/1.1\r\nHost: x\r\nAccept-Encoding: zstd;q=0.2, gzip;q=0.9\r\nConnection: close\r\n\r\n", &buf);
@@ -3551,7 +3574,7 @@ test "Server: a warm HTTP/1.1 keepalive connection serves requests without alloc
         }
     }.run, .{&server});
     defer future.cancel(io) catch {};
-    try server.ready.wait(io);
+    try server.waitReady(io);
 
     const stream = try server.address.ip.connect(io, .{ .mode = .stream });
     defer stream.close(io);
@@ -3602,7 +3625,7 @@ test "Server: serves on an inherited listening socket (fd)" {
         }
     }.run, .{&server});
     defer future.cancel(io) catch {};
-    try server.ready.wait(io);
+    try server.waitReady(io);
     try std.testing.expectEqual(port, server.address.ip.getPort());
 
     var buf: [1024]u8 = undefined;

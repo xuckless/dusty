@@ -629,12 +629,14 @@ pub fn Engine(comptime Ctx: type) type {
                     c.nghttp2_session_want_write(conn.session) == 0;
                 // With the reader gone (the peer closed, or only half-closed
                 // its side), a handler still running may yet have a response
-                // to send: stay for it rather than drop it.
+                // to send: stay for it rather than drop it. A stream whose
+                // head never completed has no handler (`counted` is set
+                // when one starts), so nothing is coming from it.
                 var handlers_running = false;
                 if (closing) {
                     var it = conn.streams.valueIterator();
                     while (it.next()) |stream| {
-                        if (!stream.*.handler_done) handlers_running = true;
+                        if (stream.*.counted and !stream.*.handler_done) handlers_running = true;
                     }
                 }
                 conn.unlock();

@@ -52,6 +52,18 @@ pub fn concurrent(
             }
         }
     }
+    // Spawning is not a cancelation point, yet under std.Io.Threaded it can
+    // swallow a cancel: a Debug allocator captures a stack trace for the new
+    // task, and Zig 0.17's unwinder takes a cancelable lock
+    // (`std.debug.SelfInfo`'s module mutex, through `std.Options.debug_io`).
+    // Threaded keeps cancel state per OS thread, whichever instance asks, so
+    // when that lock is contended it acknowledges the cancel pending on the
+    // spawning task and the unwinder drops the error. Every later syscall of
+    // that task then runs uncancelable, and its next blocking wait (an
+    // accept, an event) blocks the shutdown for good. Blocked here, the
+    // cancel stays pending for that wait.
+    const protection = io.swapCancelProtection(.blocked);
+    defer _ = io.swapCancelProtection(protection);
     return group.concurrent(io, func, args);
 }
 

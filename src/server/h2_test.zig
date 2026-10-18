@@ -300,7 +300,7 @@ const Fixture = struct {
         self.server.router.post("/ignore", Handlers.ignoreBody);
         self.server.router.get("/slow", Handlers.slow);
         self.future = try io.concurrent(run, .{&self.server});
-        try self.server.ready.wait(io);
+        try self.server.waitReady(io);
     }
 
     fn run(s: *dusty.Server(void)) anyerror!void {
@@ -466,7 +466,7 @@ test "HTTP/2: over TLS, chosen through ALPN" {
     server.router.post("/echo", Handlers.echo);
     var future = try io.concurrent(Fixture.run, .{&server});
     defer future.cancel(io) catch {};
-    try server.ready.wait(io);
+    try server.waitReady(io);
 
     const ca: dusty.TlsCa = .{ .file = .{ .path = "examples/certs/cert.pem" } };
     var bundle = try ca.load(std.testing.allocator, io);
@@ -524,7 +524,7 @@ test "HTTP/2: a warm connection serves requests without allocating" {
     server.router.get("/users/:id", Handlers.user);
     var future = try io.concurrent(Fixture.run, .{&server});
     defer future.cancel(io) catch {};
-    try server.ready.wait(io);
+    try server.waitReady(io);
 
     var client: TestClient = undefined;
     try client.init(std.testing.allocator, io, server.address.ip);
@@ -624,7 +624,7 @@ test "HTTP/2: a PROXY protocol header ahead of TLS names the client of an h2 str
     server.router.get("/who", Handlers.who);
     var future = try io.concurrent(Fixture.run, .{&server});
     defer future.cancel(io) catch {};
-    try server.ready.wait(io);
+    try server.waitReady(io);
 
     const ca: dusty.TlsCa = .{ .file = .{ .path = "examples/certs/cert.pem" } };
     var bundle = try ca.load(std.testing.allocator, io);

@@ -104,7 +104,11 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         })) |zlib_dep| {
-            mod.addImport("zlib", zlib_dep.module("zlib"));
+            const zlib_mod = zlib_dep.module("zlib");
+            // Its C (the vendored zlib) is compiled into the module, which
+            // the fuzzer cannot take (see llhttp below).
+            zlib_mod.fuzz = false;
+            mod.addImport("zlib", zlib_mod);
         }
     } else {
         mod.addAnonymousImport("zlib", .{
@@ -121,14 +125,16 @@ pub fn build(b: *std.Build) void {
     mod.addImport("llhttp", translate_c.createModule());
 
     mod.link_libc = true;
-    mod.addCSourceFiles(.{
-        .files = &[_][]const u8{
-            "src/llhttp/llhttp.c",
-            "src/llhttp/api.c",
-            "src/llhttp/http.c",
-        },
-        .flags = &.{"-std=c99"},
-    });
+    // llhttp is a library of its own, not C sources of this module, so the
+    // module holds only Zig: Zig 0.17's fuzzer cannot take clang's coverage
+    // tables from C compiled into a fuzzed module ("pc counters length and
+    // pcs length do not match"). Linked from here, it comes along with the
+    // module all the same.
+    mod.linkLibrary(cLibrary(b, "llhttp", target, optimize, &.{
+        "src/llhttp/llhttp.c",
+        "src/llhttp/api.c",
+        "src/llhttp/http.c",
+    }, &.{"-std=c99"}, &.{"src/llhttp"}));
     mod.addIncludePath(b.path("src/llhttp"));
 
     // HTTP/2 via vendored nghttp2 (src/nghttp2), gated behind use_http2. The
@@ -170,37 +176,35 @@ pub fn build(b: *std.Build) void {
             else => &([_][]const u8{ c99, staticlib, "-D_GNU_SOURCE" } ++ have_posix),
         };
 
-        mod.addCSourceFiles(.{
-            .files = &[_][]const u8{
-                "src/nghttp2/lib/nghttp2_alpn.c",
-                "src/nghttp2/lib/nghttp2_buf.c",
-                "src/nghttp2/lib/nghttp2_callbacks.c",
-                "src/nghttp2/lib/nghttp2_debug.c",
-                "src/nghttp2/lib/nghttp2_extpri.c",
-                "src/nghttp2/lib/nghttp2_frame.c",
-                "src/nghttp2/lib/nghttp2_hd.c",
-                "src/nghttp2/lib/nghttp2_hd_huffman.c",
-                "src/nghttp2/lib/nghttp2_hd_huffman_data.c",
-                "src/nghttp2/lib/nghttp2_helper.c",
-                "src/nghttp2/lib/nghttp2_http.c",
-                "src/nghttp2/lib/nghttp2_map.c",
-                "src/nghttp2/lib/nghttp2_mem.c",
-                "src/nghttp2/lib/nghttp2_option.c",
-                "src/nghttp2/lib/nghttp2_outbound_item.c",
-                "src/nghttp2/lib/nghttp2_pq.c",
-                "src/nghttp2/lib/nghttp2_priority_spec.c",
-                "src/nghttp2/lib/nghttp2_queue.c",
-                "src/nghttp2/lib/nghttp2_ratelim.c",
-                "src/nghttp2/lib/nghttp2_rcbuf.c",
-                "src/nghttp2/lib/nghttp2_session.c",
-                "src/nghttp2/lib/nghttp2_stream.c",
-                "src/nghttp2/lib/nghttp2_submit.c",
-                "src/nghttp2/lib/nghttp2_time.c",
-                "src/nghttp2/lib/nghttp2_version.c",
-                "src/nghttp2/lib/sfparse.c",
-            },
-            .flags = nghttp2_flags,
-        });
+        // A library of its own, as llhttp is.
+        mod.linkLibrary(cLibrary(b, "nghttp2", target, optimize, &.{
+            "src/nghttp2/lib/nghttp2_alpn.c",
+            "src/nghttp2/lib/nghttp2_buf.c",
+            "src/nghttp2/lib/nghttp2_callbacks.c",
+            "src/nghttp2/lib/nghttp2_debug.c",
+            "src/nghttp2/lib/nghttp2_extpri.c",
+            "src/nghttp2/lib/nghttp2_frame.c",
+            "src/nghttp2/lib/nghttp2_hd.c",
+            "src/nghttp2/lib/nghttp2_hd_huffman.c",
+            "src/nghttp2/lib/nghttp2_hd_huffman_data.c",
+            "src/nghttp2/lib/nghttp2_helper.c",
+            "src/nghttp2/lib/nghttp2_http.c",
+            "src/nghttp2/lib/nghttp2_map.c",
+            "src/nghttp2/lib/nghttp2_mem.c",
+            "src/nghttp2/lib/nghttp2_option.c",
+            "src/nghttp2/lib/nghttp2_outbound_item.c",
+            "src/nghttp2/lib/nghttp2_pq.c",
+            "src/nghttp2/lib/nghttp2_priority_spec.c",
+            "src/nghttp2/lib/nghttp2_queue.c",
+            "src/nghttp2/lib/nghttp2_ratelim.c",
+            "src/nghttp2/lib/nghttp2_rcbuf.c",
+            "src/nghttp2/lib/nghttp2_session.c",
+            "src/nghttp2/lib/nghttp2_stream.c",
+            "src/nghttp2/lib/nghttp2_submit.c",
+            "src/nghttp2/lib/nghttp2_time.c",
+            "src/nghttp2/lib/nghttp2_version.c",
+            "src/nghttp2/lib/sfparse.c",
+        }, nghttp2_flags, &.{ "src/nghttp2/lib", "src/nghttp2/lib/includes" }));
         mod.addIncludePath(b.path("src/nghttp2/lib"));
         mod.addIncludePath(b.path("src/nghttp2/lib/includes"));
     }
@@ -261,6 +265,19 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
 
+    // The "fuzz:" tests under Zig's own test runner, which is what drives
+    // the fuzzer (`zig build fuzz --fuzz=200K`); dusty's runner has none.
+    // `zig build test` runs the same targets on their seeds and a few
+    // thousand fixed mutations.
+    const fuzz_tests = b.addTest(.{
+        .root_module = mod,
+        .filters = &.{"fuzz:"},
+        // Zig 0.17's self-hosted backend (the Debug default on
+        // x86_64-linux) emits no coverage tables for the fuzzer.
+        .use_llvm = b.option(bool, "llvm", "Build the tests with LLVM (needed for --fuzz on x86_64-linux)"),
+    });
+    b.step("fuzz", "Run the fuzz targets (with --fuzz, fuzz them)").dependOn(&b.addRunArtifact(fuzz_tests).step);
+
     const assets_gen_tests = b.addTest(.{
         .root_module = assets_gen.root_module,
         .test_runner = .{ .path = b.path("test_runner.zig"), .mode = .simple },
@@ -292,6 +309,26 @@ pub fn build(b: *std.Build) void {
     //
     // Lastly, the Zig build system is relatively simple and self-contained,
     // and reading its source code will allow you to master it.
+}
+
+/// A static library of C sources, for a module to link.
+fn cLibrary(
+    b: *std.Build,
+    name: []const u8,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    files: []const []const u8,
+    flags: []const []const u8,
+    include_dirs: []const []const u8,
+) *std.Build.Step.Compile {
+    const lib = b.addLibrary(.{
+        .name = name,
+        .linkage = .static,
+        .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }),
+    });
+    lib.root_module.addCSourceFiles(.{ .files = files, .flags = flags });
+    for (include_dirs) |dir| lib.root_module.addIncludePath(b.path(dir));
+    return lib;
 }
 
 pub const AssetsOptions = struct {

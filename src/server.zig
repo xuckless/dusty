@@ -10,6 +10,7 @@ const Router = @import("router.zig").Router;
 const Action = @import("router.zig").Action;
 const RequestParser = @import("parser.zig").RequestParser;
 const RequestBodyReader = @import("parser.zig").RequestBodyReader;
+const ParseError = @import("parser.zig").ParseError;
 const Request = @import("request.zig").Request;
 const parseHeaders = @import("request.zig").parseHeaders;
 const Headers = @import("http.zig").Headers;
@@ -580,12 +581,20 @@ pub fn Server(comptime Ctx: type) type {
         /// in before `ready` is set, and empty again once `run` has
         /// returned.
         addresses: []const Address = &.{},
+        /// Set once `run` is listening. A server that fails before then
+        /// never sets it: wait with `waitReady` instead, which also
+        /// returns when `run` has stopped without getting there.
         ready: std.Io.Event,
         /// Set when the drain starts (and never reset). Long-lived handlers
         /// (WebSockets, event streams) can wait on it, through
         /// `Request.drain`, to finish early rather than be cut off at
         /// `timeout.shutdown`.
         draining: std.Io.Event = .unset,
+        /// Set with `ready`, or when `run` stops before it is listening,
+        /// with `start_error` saying why.
+        settled: std.Io.Event = .unset,
+        /// Why `run` stopped before it was listening.
+        start_error: ?anyerror = null,
         _middleware_registry: std.SinglyLinkedList,
         request_buffers: RequestBuffersPool,
         /// The listeners while `run` serves them, for `reloadTls`; empty
@@ -712,11 +721,24 @@ pub fn Server(comptime Ctx: type) type {
         /// it was canceled, even if it was failing for another reason by then.
         pub fn run(self: *Self) !void {
             self.serve() catch |err| {
+                // Wakes whoever waits in `waitReady`; they would otherwise
+                // wait for good.
+                if (!self.settled.isSet()) {
+                    self.start_error = err;
+                    self.settled.set(self.io);
+                }
                 // A cancel that arrived while `serve` failed for another
                 // reason is still pending, and is what the caller asked about.
                 if (err != error.Canceled) try self.io.checkCancel();
                 return err;
             };
+        }
+
+        /// Waits until `run` is listening, and returns what stopped it if it
+        /// never got there.
+        pub fn waitReady(self: *Self, io: std.Io) !void {
+            try self.settled.wait(io);
+            if (self.start_error) |err| return err;
         }
 
         fn serve(self: *Self) !void {
@@ -777,8 +799,15 @@ pub fn Server(comptime Ctx: type) type {
             defer self.addresses = &.{};
             self.address = addresses[0];
             self.ready.set(self.io);
+            self.settled.set(self.io);
 
-            for (active) |*l| log.info("Listening on {f}", .{l.address});
+            {
+                // Logging allocates, which can swallow a cancel (see
+                // `placement.concurrent`): it must reach the wait below.
+                const protection = self.io.swapCancelProtection(.blocked);
+                defer _ = self.io.swapCancelProtection(protection);
+                for (active) |*l| log.info("Listening on {f}", .{l.address});
+            }
 
             var connections: std.Io.Group = .init;
             defer {
@@ -1053,7 +1082,14 @@ pub fn Server(comptime Ctx: type) type {
                     error.Unexpected,
                     => {
                         backoff_ms = if (backoff_ms == 0) min_accept_backoff_ms else @min(backoff_ms * 2, max_accept_backoff_ms);
-                        log.warn("Accept failed: {}; retrying in {d}ms", .{ err, backoff_ms });
+                        {
+                            // Logging allocates, which can swallow a cancel
+                            // (see `placement.concurrent`): it must reach the
+                            // sleep below.
+                            const protection = self.io.swapCancelProtection(.blocked);
+                            defer _ = self.io.swapCancelProtection(protection);
+                            log.warn("Accept failed: {}; retrying in {d}ms", .{ err, backoff_ms });
+                        }
                         // A cancel is taken here, not deferred to the accept
                         // above with `recancel`. That accept keeps failing
                         // for its own reason -- the fd table is full, which
@@ -1302,10 +1338,26 @@ pub fn Server(comptime Ctx: type) type {
                 // out the failures worth looking at.
                 if (Connection.isPeerGone(err)) {
                     log.debug("Connection closed by peer: {}", .{err});
+                } else if (isMalformedRequest(err)) {
+                    // Anyone who can reach the port can send bytes that are
+                    // not HTTP, so this is not the server's error and must
+                    // not flood the error log (nginx logs these at info, as
+                    // the TLS handshake failures above are).
+                    log.info("Malformed request: {}", .{err});
                 } else {
                     log.err("Connection error: {}", .{err});
                 }
             };
+        }
+
+        /// A request head the peer got wrong: llhttp refused it, or the
+        /// connection ended inside it.
+        fn isMalformedRequest(err: anyerror) bool {
+            if (err == error.IncompleteRequest) return true;
+            inline for (comptime std.meta.fieldNames(ParseError)) |name| {
+                if (err == @field(anyerror, name)) return true;
+            }
+            return false;
         }
 
         /// Hangs up on a peer whose input was not all read, so the peer
@@ -1947,4 +1999,119 @@ test "Connection: isPeerGone separates a departed peer from a real failure" {
     try std.testing.expect(!Connection.isPeerGone(error.TlsConnectionTruncated));
     try std.testing.expect(!Connection.isPeerGone(error.TlsBadRecordMac));
     try std.testing.expect(!Connection.isPeerGone(error.Canceled));
+}
+
+/// One connection's bytes through `handleConnectionWrapper` over a socket pair:
+/// HTTP/1.1, or HTTP/2 with prior knowledge when the library has it. The
+/// handlers hand request headers back as response headers and the body
+/// back as the body, so what the peer controls reaches the response side
+/// too (the HTTP/1 writer, or the HTTP/2 engine's sink).
+fn fuzzConnection(input: []const u8) !void {
+    // An `Io` of its own: under `--fuzz`, Zig 0.17's test runner gives every
+    // input a fresh `std.testing.allocator` but keeps `std.testing.io`,
+    // which allocates its tasks from the allocator it was made with, so its
+    // tasks would outlive the allocator they came from.
+    var threaded: std.Io.Threaded = .init(std.heap.smp_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const listener: @import("config.zig").Listener = .{
+        .address = .{ .ip = .{ .ip4 = .loopback(0) } },
+        .http2_prior_knowledge = build_options.use_http2,
+    };
+    var server = Server(void).init(std.testing.allocator, io, .{ .listeners = &.{listener} }, {});
+    defer server.deinit();
+    const handlers = struct {
+        fn echo(req: *Request, res: *Response) !void {
+            for (req.headers.keys[0..req.headers.len], req.headers.values[0..req.headers.len]) |name, value| {
+                if (std.ascii.startsWithIgnoreCase(name, "x-")) try res.header(name, value);
+            }
+            if (req.headers.get("x-trailer")) |value| try res.trailer("x-trailer", value);
+            // As a handler should: a body the peer got wrong is its error.
+            res.body = (req.body() catch {
+                res.status = .bad_request;
+                return;
+            }) orelse "";
+        }
+    };
+    server.router.get("/", handlers.echo);
+    server.router.post("/", handlers.echo);
+    server.router.put("/*rest", handlers.echo);
+
+    var l: Server(void).ActiveListener = .{ .config = &listener, .address = listener.address, .server = undefined };
+    var fds: [2]std.c.fd_t = undefined;
+    if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &fds) != 0) return error.SocketPair;
+    defer _ = std.c.close(fds[1]);
+    const stream: std.Io.net.Stream = .{ .socket = .{ .handle = fds[0], .address = .{ .ip4 = .loopback(40000) } } };
+
+    // As the accept loop leaves it.
+    _ = server.busy.fetchAdd(.{ .count = 1 }, .acq_rel);
+    try server.reserveConnectionSlot();
+    // With the deadline watch the accept loop gives it, which also bounds
+    // a lingering close rather than sleeping it out.
+    var future = try io.concurrent(Server(void).handleConnectionWrapper, .{ &server, &l, stream });
+    var finished = false;
+    defer if (!finished) future.cancel(io) catch {};
+    var wrote: usize = 0;
+    while (wrote < input.len) {
+        const n = std.c.write(fds[1], input[wrote..].ptr, input.len - wrote);
+        if (n <= 0) break; // the server hung up first
+        wrote += @intCast(n);
+    }
+    _ = std.c.shutdown(fds[1], std.c.SHUT.WR);
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(std.testing.allocator);
+    while (true) {
+        var pfd = [_]std.c.pollfd{.{ .fd = fds[1], .events = std.c.POLL.IN, .revents = 0 }};
+        // The peer is done, so the server must finish on its own.
+        if (std.c.poll(&pfd, 1, 5_000) == 0) return error.ConnectionHung;
+        var buf: [4096]u8 = undefined;
+        const n = std.c.read(fds[1], &buf, buf.len);
+        if (n <= 0) break;
+        try out.appendSlice(std.testing.allocator, buf[0..@intCast(n)]);
+    }
+    finished = true;
+    future.await(io) catch {};
+
+    // Every response the server wrote is a response: an HTTP/1.1 status
+    // line, or (HTTP/2) frames that start with its SETTINGS.
+    if (out.items.len > 0) {
+        if (std.mem.startsWith(u8, out.items, "HTTP/1.")) {
+            var it = std.mem.splitSequence(u8, out.items, "\r\n");
+            while (it.next()) |line| for (line) |ch| {
+                // No header value smuggled a line break or a NUL out.
+                try std.testing.expect(ch != '\r' and ch != '\n' and ch != 0 or !std.ascii.startsWithIgnoreCase(line, "x-"));
+            };
+        } else {
+            try std.testing.expect(build_options.use_http2);
+            try std.testing.expect(out.items.len >= 9 and out.items[3] == 0x04);
+        }
+    }
+    // The connection gave back what it held.
+    try std.testing.expectEqual(@as(u32, 0), server.active_connections.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), server.busy.load(.acquire).count);
+}
+
+test "fuzz: a connection's bytes, HTTP/1.1 or HTTP/2 with prior knowledge" {
+    const preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+    // A client's SETTINGS (empty), then HEADERS on stream 1 with END_STREAM
+    // and END_HEADERS: :method GET, :scheme http, :path /, :authority
+    // localhost, x-a: b (HPACK, literal without indexing for the last two).
+    const h2_get = preface ++ "\x00\x00\x00\x04\x00\x00\x00\x00\x00" ++
+        "\x00\x00\x16\x01\x05\x00\x00\x00\x01" ++ "\x82\x86\x84\x01\x09localhost" ++ "\x00\x03x-a\x01b";
+    try @import("fuzz.zig").bytes(struct {
+        fn check(input: []const u8) !void {
+            try fuzzConnection(input);
+        }
+    }.check, &.{
+        "GET / HTTP/1.1\r\nHost: a\r\nX-A: 1\r\n\r\nGET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n",
+        "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\nX-Trailer: t\r\nTE: trailers\r\n\r\n3\r\nabc\r\n0\r\n\r\n",
+        "PUT /a/b HTTP/1.1\r\nContent-Length: 4\r\nExpect: 100-continue\r\n\r\nbody",
+        "GET / HTTP/1.0\r\n\r\n",
+        h2_get,
+        preface ++ "\x00\x00\x00\x04\x00\x00\x00\x00\x00" ++ "\x00\x00\x08\x07\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
+        // HEADERS waiting for a CONTINUATION that never comes: the stream
+        // never gets a handler, and must not hold the connection open.
+        preface ++ "\x00\x00\x00\x04\x00\x00\x00\x00\x00" ++ "\x00\x00\x04\x01\x01\x00\x00\x00\x01" ++ "\x82\x86\x84\x41",
+    });
 }

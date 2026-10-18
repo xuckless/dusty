@@ -151,7 +151,9 @@ from a secret store, so they never touch disk:
 When `listeners` is omitted or empty, the server listens on `127.0.0.1:8080`.
 
 A handler can tell them apart through `req.listener` and `req.secure`, and
-`server.addresses` has each listener's bound address once `server.ready` is set.
+`server.addresses` has each listener's bound address once `server.waitReady(io)`
+returns, which it does with `run`'s error instead if the server stopped before
+listening (`server.ready` is set only once it listens).
 
 ### Templating
 
