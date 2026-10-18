@@ -1758,11 +1758,12 @@ test "Server: more headers than the limit is a 431, not a dropped connection" {
 }
 
 test "Server: a response written without reading the body does not wait for one held back by Expect" {
-    // No POST route, so the 404 is written by nothing that reads the body,
-    // and the peer never sends it: it is waiting for 100 Continue.
+    // No POST route (only GET), so the 405 is written by nothing that
+    // reads the body, and the peer never sends it: it is waiting for 100
+    // Continue.
     var buf: [256]u8 = undefined;
     const status = try statusLineFor("POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 10\r\nExpect: 100-continue\r\n\r\n", &buf);
-    try std.testing.expectStringStartsWith(status, "HTTP/1.1 404 ");
+    try std.testing.expectStringStartsWith(status, "HTTP/1.1 405 ");
 }
 
 test "Server: a body sent without waiting for 100 Continue is drained and the connection kept" {
@@ -3393,4 +3394,60 @@ test "Server: forwarding headers are ignored without trusted hops" {
     const resp = try rawAll(io, &server, "GET /who HTTP/1.1\r\nHost: internal:8080\r\nX-Forwarded-For: 203.0.113.9\r\nX-Forwarded-Proto: https\r\nX-Forwarded-Host: shop.example.com\r\nConnection: close\r\n\r\n", &out);
     try std.testing.expect(std.mem.indexOf(u8, resp, "127.0.0.1:") != null);
     try std.testing.expect(std.mem.endsWith(u8, resp, "secure=false host=internal:8080"));
+}
+
+test "Server: a path with routes for other methods answers 405 with Allow" {
+    const io = std.testing.io;
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
+    defer server.deinit();
+    const H = struct {
+        fn ok(_: *dusty.Request, res: *dusty.Response) !void {
+            res.body = "ok";
+        }
+    };
+    server.router.get("/items/:id", H.ok);
+    server.router.put("/items/:id", H.ok);
+    var future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer future.cancel(io) catch {};
+    try server.ready.wait(io);
+
+    var buf: [1024]u8 = undefined;
+    const head = try rawHead(io, &server, "POST /items/7 HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", &buf);
+    try std.testing.expect(std.mem.startsWith(u8, head, "HTTP/1.1 405 Method Not Allowed\r\n"));
+    try std.testing.expect(std.mem.indexOf(u8, head, "\r\nAllow: GET, PUT, HEAD") != null);
+    var buf2: [1024]u8 = undefined;
+    const missing = try rawHead(io, &server, "POST /nothing HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", &buf2);
+    try std.testing.expect(std.mem.startsWith(u8, missing, "HTTP/1.1 404 Not Found\r\n"));
+}
+
+test "Server: compression follows the client's q-values over the server's preference" {
+    if (!@import("build_options").use_zlib) return error.SkipZigTest;
+    const io = std.testing.io;
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
+    defer server.deinit();
+    server.router.get("/text", struct {
+        fn handle(_: *dusty.Request, res: *dusty.Response) !void {
+            res.compress = true;
+            res.content_type = .text;
+            res.body = comptime repeat("compressible ", 40);
+        }
+    }.handle);
+    var future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer future.cancel(io) catch {};
+    try server.ready.wait(io);
+
+    var buf: [4096]u8 = undefined;
+    const head = try rawHead(io, &server, "GET /text HTTP/1.1\r\nHost: x\r\nAccept-Encoding: zstd;q=0.2, gzip;q=0.9\r\nConnection: close\r\n\r\n", &buf);
+    try std.testing.expect(std.mem.indexOf(u8, head, "Content-Encoding: gzip") != null);
+    var buf2: [4096]u8 = undefined;
+    const none = try rawHead(io, &server, "GET /text HTTP/1.1\r\nHost: x\r\nAccept-Encoding: gzip;q=0, *;q=0\r\nConnection: close\r\n\r\n", &buf2);
+    try std.testing.expect(std.mem.indexOf(u8, none, "Content-Encoding") == null);
 }

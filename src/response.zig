@@ -1226,10 +1226,12 @@ pub const Response = struct {
         if (self.headers.keys.len - self.headers.len < needed) return .off;
 
         const request = self.request orelse return .identity;
-        // Server preference: zstd compresses better and faster than gzip.
-        if (build_options.use_zstd and http.acceptsEncoding(&request.headers, "zstd")) return .zstd;
-        if (build_options.use_zlib and http.acceptsGzip(&request.headers)) return .gzip;
-        return .identity;
+        // The client's q-values first; on a tie, zstd, which compresses
+        // better and faster than gzip.
+        const zstd_q: u16 = if (build_options.use_zstd) http.encodingQuality(&request.headers, "zstd") else 0;
+        const gzip_q: u16 = if (build_options.use_zlib) http.encodingQuality(&request.headers, "gzip") else 0;
+        if (zstd_q == 0 and gzip_q == 0) return .identity;
+        return if (zstd_q >= gzip_q) .zstd else .gzip;
     }
 
     /// `Vary: *` included, which says the response varies by anything.

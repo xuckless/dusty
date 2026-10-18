@@ -25,7 +25,32 @@ pub const StaticOptions = struct {
     /// such open flag, and zio, stricter, fails the open where it cannot
     /// guarantee it. Without it, symlinks are followed wherever they lead.
     resolve_beneath: bool = false,
+    /// Sent as `Cache-Control` with a 200, 206 or 304, such as
+    /// "public, max-age=3600". Copied by the router.
+    cache_control: ?[]const u8 = null,
 };
+
+/// `candidates` in the order to try them for `req`: by the client's
+/// q-value, then in the order given. Refused ones are left out.
+fn byQuality(req: *const Request, candidates: []const Precompressed, out: *[8]Precompressed) []const Precompressed {
+    var qs: [8]u16 = undefined;
+    var n: usize = 0;
+    for (candidates) |candidate| {
+        if (n == out.len) break;
+        const q = http.encodingQuality(&req.headers, candidate.name());
+        if (q == 0) continue;
+        // Insertion sort, stable: after every entry at least as good.
+        var i = n;
+        while (i > 0 and qs[i - 1] < q) : (i -= 1) {
+            qs[i] = qs[i - 1];
+            out[i] = out[i - 1];
+        }
+        qs[i] = q;
+        out[i] = candidate;
+        n += 1;
+    }
+    return out[0..n];
+}
 
 pub const Precompressed = enum {
     br,
@@ -110,8 +135,8 @@ pub const Static = struct {
             // Which file is served depends on Accept-Encoding, whichever it
             // turns out to be.
             try addVary(req, res);
-            for (self.options.precompressed) |candidate| {
-                if (!http.acceptsEncoding(&req.headers, candidate.name())) continue;
+            var order: [8]Precompressed = undefined;
+            for (byQuality(req, self.options.precompressed, &order)) |candidate| {
                 const path = try std.mem.concat(req.arena, u8, &.{ served, candidate.extension() });
                 if (res.sendFile(self.dir, path, open)) |compressed| {
                     stat = compressed;
@@ -124,6 +149,11 @@ pub const Static = struct {
         }
         if (encoding) |e| try res.header("Content-Encoding", e.name());
         try finish(req, res, try formatEtag(req.arena, stat, encoding), mtimeSeconds(stat));
+        // Not on a 412 or 416, which a cache could otherwise keep.
+        if (self.options.cache_control) |cc| switch (res.status) {
+            .ok, .partial_content, .not_modified => try res.header("Cache-Control", cc),
+            else => {},
+        };
         return true;
     }
 };
@@ -205,9 +235,9 @@ pub const Embedded = struct {
             // Which copy is served depends on Accept-Encoding, whichever it
             // turns out to be.
             try addVary(req, res);
-            for (std.enums.values(Precompressed)) |candidate| {
+            var order: [8]Precompressed = undefined;
+            for (byQuality(req, std.enums.values(Precompressed), &order)) |candidate| {
                 const copy = self.compressed[@intFromEnum(candidate)] orelse continue;
-                if (!http.acceptsEncoding(&req.headers, candidate.name())) continue;
                 variant = copy;
                 try res.header("Content-Encoding", candidate.name());
                 break;
