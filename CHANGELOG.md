@@ -12,6 +12,11 @@ All notable changes to this project will be documented in this file.
 - Added `ServerConfig.Tls.alpn_protocols`, the protocols a TLS listener
   offers through ALPN in preference order, and the server
   `Connection.negotiatedProtocol()` that reports the agreed one.
+- Added `ServerConfig.Tls.pem` to give a listener its certificate and key as
+  PEM text in memory instead of file paths, so a key from a secret store or
+  generated at startup never touches disk. `cert_path` and `key_path` now
+  default to empty, and `listen()` fails with `error.MissingTlsCertificate`
+  when neither form is given.
 - `Listener.kernel_backlog` now defaults to the system's limit, `net.core.somaxconn`
   on Linux, instead of 1024. A full accept queue makes Linux drop new connections,
   which then wait a second or more to retry.
