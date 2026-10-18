@@ -669,6 +669,7 @@ pub fn Engine(comptime Ctx: type) type {
                 .secure = conn.secure,
                 .version_major = 2,
                 .version_minor = 0,
+                .drain = &server.draining,
                 ._timeout_context = &timer,
                 ._set_timeout = setTimeout,
             };

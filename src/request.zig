@@ -67,6 +67,11 @@ pub const Request = struct {
     /// by a tracing middleware; empty without one.
     trace_id: []const u8 = "",
     span_id: []const u8 = "",
+    /// Set when the server starts to drain: a handler that runs for long
+    /// (a WebSocket, an event stream) can wait on it, or check `isSet`, to
+    /// wind down rather than be cut off at `timeout.shutdown`. Null in a
+    /// request the server did not build.
+    drain: ?*std.Io.Event = null,
 
     arena: std.mem.Allocator,
     io: std.Io = undefined,
@@ -120,6 +125,7 @@ pub const Request = struct {
         const addr = self.remote_address;
         const listener = self.listener;
         const secure = self.secure;
+        const drain = self.drain;
         self.* = .{
             .arena = arena,
             .io = io,
@@ -130,6 +136,7 @@ pub const Request = struct {
             .remote_address = addr,
             .listener = listener,
             .secure = secure,
+            .drain = drain,
             ._timeout_context = timeout_context,
             ._set_timeout = set_timeout,
         };
