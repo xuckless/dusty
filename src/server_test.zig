@@ -2553,6 +2553,99 @@ test "Server: a request head too large for the buffer gets 431, not a panic" {
     try client_future.await(io);
 }
 
+test "Server: a head that is not HTTP/1.x gets a 400 and a clean close, an HTTP/2 preface the close alone" {
+    const io = std.testing.io;
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
+    defer server.deinit();
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            s.run() catch |err| {
+                if (err != error.Canceled) return err;
+            };
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    var client_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void), _io: std.Io) !void {
+            try s.ready.wait(_io);
+            for ([_][]const u8{ "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n", "GET / HTTP/1.1\r\nBad Header\r\n\r\n", "\x16\x03\x01\x02\x00" }) |head| {
+                const stream = try s.address.ip.connect(_io, .{ .mode = .stream });
+                defer stream.close(_io);
+
+                // The head, then more than the server reads with it (an
+                // HTTP/2 client's SETTINGS and the like): closing with it
+                // unread would reset the connection under the answer.
+                var write_buf: [1024]u8 = undefined;
+                var writer = stream.writer(_io, &write_buf);
+                writer.interface.writeAll(head) catch {};
+                writer.interface.splatByteAll(0, 20000) catch {};
+                writer.interface.flush() catch {};
+
+                var read_buf: [1024]u8 = undefined;
+                var reader = stream.reader(_io, &read_buf);
+                // The end is a FIN, not a reset.
+                const answer = try reader.interface.allocRemaining(std.testing.allocator, .limited(1024));
+                defer std.testing.allocator.free(answer);
+                if (std.mem.startsWith(u8, head, "PRI ")) {
+                    try std.testing.expectEqualStrings("", answer);
+                } else {
+                    try std.testing.expectStringStartsWith(answer, "HTTP/1.1 400 Bad Request\r\n");
+                }
+            }
+        }
+    }.run, .{ &server, io });
+
+    try client_future.await(io);
+}
+
+test "Server: Response.abort closes the connection under a streamed body" {
+    const io = std.testing.io;
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
+    defer server.deinit();
+    server.router.get("/", struct {
+        fn handle(_: *dusty.Request, res: *dusty.Response) !void {
+            var buf: [64]u8 = undefined;
+            var w = try res.stream(&buf);
+            try w.interface.writeAll("[1,");
+            try w.interface.flush();
+            return res.abort();
+        }
+    }.handle);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            s.run() catch |err| {
+                if (err != error.Canceled) return err;
+            };
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    var client_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void), _io: std.Io) !void {
+            try s.ready.wait(_io);
+            const stream = try s.address.ip.connect(_io, .{ .mode = .stream });
+            defer stream.close(_io);
+            var write_buf: [256]u8 = undefined;
+            var writer = stream.writer(_io, &write_buf);
+            try writer.interface.writeAll("GET / HTTP/1.1\r\nHost: a\r\n\r\n");
+            try writer.interface.flush();
+            var read_buf: [1024]u8 = undefined;
+            var reader = stream.reader(_io, &read_buf);
+            const answer = try reader.interface.allocRemaining(std.testing.allocator, .limited(1024));
+            defer std.testing.allocator.free(answer);
+            // The chunk that went out, and no terminating chunk.
+            try std.testing.expect(std.mem.endsWith(u8, answer, "\r\n\r\n3\r\n[1,\r\n"));
+        }
+    }.run, .{ &server, io });
+
+    try client_future.await(io);
+}
+
 test "Server: a peer that will not hang up after a 431 is hung up on anyway" {
     const io = std.testing.io;
 

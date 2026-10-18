@@ -745,6 +745,18 @@ pub const Response = struct {
         try self.trailers.?.put(name, value);
     }
 
+    /// Ends the response unfinished, for a handler that cannot complete
+    /// one it has started (a stream whose source failed part way): return
+    /// what this returns. HTTP/2 resets the stream (CANCEL), and HTTP/1.x
+    /// closes the connection without the rest of the body, so the peer
+    /// sees a cut-short response rather than a complete one. With nothing
+    /// sent yet, the peer gets the reset or the close alone. Not logged as
+    /// a server error.
+    pub fn abort(self: *Response) error{ResponseAborted} {
+        self.keepalive = false;
+        return error.ResponseAborted;
+    }
+
     /// Whether the peer went away, so a failure is not the handler's fault.
     pub fn peerGone(self: *Response) bool {
         if (self.sink) |sink| return sink.peerGone();

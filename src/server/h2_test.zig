@@ -788,6 +788,33 @@ test "HTTP/2: a handler is let go when the client resets its stream, and the con
     try std.testing.expectEqualStrings("hello", client.get(next).body.items);
 }
 
+test "HTTP/2: Response.abort resets the stream, and the connection carries on" {
+    const io = std.testing.io;
+    var fx: Fixture = undefined;
+    try fx.start(io);
+    defer fx.stop(io);
+    fx.server.router.get("/abort", struct {
+        fn handle(_: *dusty.Request, res: *dusty.Response) !void {
+            var buf: [64]u8 = undefined;
+            var w = try res.stream(&buf);
+            try w.interface.writeAll("[1,");
+            try w.interface.flush();
+            return res.abort();
+        }
+    }.handle);
+
+    var client: TestClient = undefined;
+    try client.init(std.testing.allocator, io, fx.server.address.ip);
+    defer client.deinit();
+    const id = try client.request("GET", "/abort", null);
+    try client.run();
+    try std.testing.expectEqual(@as(u32, c.NGHTTP2_CANCEL), client.get(id).error_code);
+
+    const next = try client.request("GET", "/hello", null);
+    try client.run();
+    try std.testing.expectEqualStrings("hello", client.get(next).body.items);
+}
+
 test "HTTP/2: a handler is let go when the client closes the connection" {
     const io = std.testing.io;
     var fx: Fixture = undefined;

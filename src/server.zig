@@ -538,6 +538,20 @@ fn sendHeadersTooLarge(w: *std.Io.Writer) std.Io.Writer.Error!void {
     return w.flush();
 }
 
+/// For a head llhttp refused: fixed bytes, since there is no request to
+/// answer through `Response`, and `Connection: close`, since there is no
+/// framing to find the next request by.
+fn sendBadRequest(w: *std.Io.Writer) std.Io.Writer.Error!void {
+    try w.writeAll("HTTP/1.1 400 Bad Request\r\n" ++
+        "Connection: close\r\n" ++
+        "Content-Length: 0\r\n" ++
+        "\r\n");
+    return w.flush();
+}
+
+/// The first line of the HTTP/2 connection preface (RFC 9113 3.4).
+const h2_preface_line = "PRI * HTTP/2.0\r\n";
+
 pub const Address = @import("config.zig").Address;
 pub const Listener = @import("config.zig").Listener;
 
@@ -1738,6 +1752,31 @@ pub fn Server(comptime Ctx: type) type {
                             return connection.getWriteError() orelse error.Unexpected;
                         return self.lingeringClose(connection, timer, &idle_read_buffer, &buffers);
                     },
+                    // A head that is not HTTP/1.x: 400, and a lingering
+                    // close, so the peer reads the answer and a FIN rather
+                    // than a reset for the bytes it sent after. An HTTP/2
+                    // preface (a client that went ahead with HTTP/2 although
+                    // ALPN did not agree on it) gets the close alone: it
+                    // would read an HTTP/1.1 answer as a frame. Logged at
+                    // info, as `runConnection` logs the other malformed
+                    // requests: any peer can send one.
+                    error.InvalidMethod,
+                    error.InvalidUrl,
+                    error.InvalidHeaderToken,
+                    error.InvalidHeaderValue,
+                    error.InvalidVersion,
+                    error.InvalidStatus,
+                    error.InvalidChunkSize,
+                    error.UnexpectedContentLength,
+                    error.ParseFailed,
+                    => |e| {
+                        log.info("Malformed request: {}", .{e});
+                        if (!std.mem.startsWith(u8, connection.reader.buffered(), h2_preface_line)) {
+                            sendBadRequest(connection.writer) catch
+                                return connection.getWriteError() orelse error.Unexpected;
+                        }
+                        return self.lingeringClose(connection, timer, &idle_read_buffer, &buffers);
+                    },
                     else => |e| return e,
                 };
                 // The head is in: from here the request deadline alone.
@@ -1828,6 +1867,12 @@ pub fn Server(comptime Ctx: type) type {
                 executor.run() catch |err| switch (err) {
                     error.ReadFailed => return connection.getReadError() orelse error.Unexpected,
                     error.WriteFailed => return connection.getWriteError() orelse error.Unexpected,
+                    // `Response.abort`: the connection closes under the
+                    // unfinished response, which is the abort.
+                    error.ResponseAborted => {
+                        log.debug("Response aborted ({f} {s})", .{ request.method, request.url });
+                        return;
+                    },
                     else => |e| return e,
                 };
 
