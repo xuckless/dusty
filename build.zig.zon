@@ -47,8 +47,11 @@
         "build.zig",
         "build.zig.zon",
         "src",
-        // For example...
-        //"LICENSE",
-        //"README.md",
+        "LICENSE",
+        // So a package consumer can run the test suite (with its own TLS
+        // module injected, say): the runner and the certificates the tests
+        // load.
+        "test_runner.zig",
+        "examples/certs",
     },
 }
