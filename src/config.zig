@@ -115,6 +115,16 @@ pub const Listener = struct {
         if (self.acceptors) |n| return @max(1, n);
         return @intCast(@min(@max(2, std.math.log2_int(usize, @max(1, cpu_count))), std.math.maxInt(u16)));
     }
+
+    /// `acceptorCount`, except that on a runtime with `executors` executors
+    /// (zio, several of them) an unset `acceptors` means one accept loop per
+    /// executor: each executor accepts its own connections and keeps them.
+    pub fn acceptorCountFor(self: *const Listener, cpu_count: usize, executors: ?usize) u16 {
+        if (self.acceptors == null) {
+            if (executors) |n| if (n > 1) return @intCast(@min(n, std.math.maxInt(u16)));
+        }
+        return self.acceptorCount(cpu_count);
+    }
 };
 
 /// Used when `ServerConfig.listeners` is empty.

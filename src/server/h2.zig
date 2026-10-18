@@ -41,6 +41,7 @@ const Response = @import("../response.zig").Response;
 const Sink = @import("../sink.zig").Sink;
 const Transport = @import("../transport.zig").Transport;
 const Timer = @import("../deadline.zig").Timer;
+const placement = @import("../placement.zig");
 
 const log = std.log.scoped(.dusty_h2);
 
@@ -299,7 +300,8 @@ pub fn Engine(comptime Ctx: type) type {
 
             var group: std.Io.Group = .init;
             defer group.cancel(conn.io);
-            try group.concurrent(conn.io, writerLoop, .{&conn});
+            // The writer and the streams stay on the connection's executor.
+            try placement.concurrent(&group, conn.io, .local, writerLoop, .{&conn});
 
             readerLoop(&conn, &group) catch |err| switch (err) {
                 error.Canceled => return error.Canceled,
@@ -983,7 +985,7 @@ pub fn Engine(comptime Ctx: type) type {
             _ = conn.server.busy.fetchAdd(.{ .count = 1 }, .acq_rel);
             conn.open_streams += 1;
             stream.counted = true;
-            group.concurrent(conn.io, runStream, .{ conn, stream }) catch {
+            placement.concurrent(group, conn.io, .local, runStream, .{ conn, stream }) catch {
                 log.err("HTTP/2: no task for stream {d}", .{stream.id});
                 stream.reset = true;
                 stream.closeBody();

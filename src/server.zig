@@ -21,6 +21,7 @@ const Transport = @import("transport.zig").Transport;
 const have_auto_cancel = @import("deadline.zig").have_auto_cancel;
 const Watch = @import("deadline.zig").Watch;
 const Timer = @import("deadline.zig").Timer;
+const placement = @import("placement.zig");
 /// The HTTP/2 engine, with the `use_http2` build option.
 const h2 = if (build_options.use_http2) @import("server/h2.zig") else struct {};
 const MiddlewareConfig = @import("middleware.zig").MiddlewareConfig;
@@ -462,6 +463,8 @@ pub fn Server(comptime Ctx: type) type {
         /// the listener.
         const Acceptor = struct {
             listener: *ActiveListener,
+            /// Which executor the loop runs on, where the runtime has several.
+            executor: usize = 0,
             /// Why this loop gave up, once it has.
             err: ?AcceptError = null,
         };
@@ -558,8 +561,9 @@ pub fn Server(comptime Ctx: type) type {
             const cpu_count: usize = for (listeners) |cfg| {
                 if (cfg.acceptors == null) break try cgroup.cpuCount(self.io);
             } else 1;
+            const executors = placement.executorCount(self.io);
             var acceptor_count: usize = 0;
-            for (listeners) |cfg| acceptor_count += cfg.acceptorCount(cpu_count);
+            for (listeners) |cfg| acceptor_count += cfg.acceptorCountFor(cpu_count, executors);
             const default_backlog: u31 = for (listeners) |cfg| {
                 if (cfg.kernel_backlog == null) break try somaxconn(self.io);
             } else 0;
@@ -580,8 +584,8 @@ pub fn Server(comptime Ctx: type) type {
             // Grouped by listener, in listener order.
             var next_acceptor: usize = 0;
             for (active) |*l| {
-                const n = l.config.acceptorCount(cpu_count);
-                for (acceptors[next_acceptor..][0..n]) |*a| a.* = .{ .listener = l };
+                const n = l.config.acceptorCountFor(cpu_count, executors);
+                for (acceptors[next_acceptor..][0..n], 0..) |*a, j| a.* = .{ .listener = l, .executor = j };
                 next_acceptor += n;
             }
 
@@ -609,7 +613,9 @@ pub fn Server(comptime Ctx: type) type {
             var accepting: std.Io.Group = .init;
             defer accepting.cancel(self.io);
             for (acceptors, 0..) |*a, i| {
-                accepting.concurrent(self.io, acceptLoop, .{ self, a, &connections, &stopped }) catch |err| {
+                // One loop per executor where the runtime has several, so each
+                // accepts, and keeps, its own connections.
+                placement.concurrent(&accepting, self.io, .{ .executor = a.executor }, acceptLoop, .{ self, a, &connections, &stopped }) catch |err| {
                     // A listener that already has a loop running is still
                     // served, only with fewer accepts waiting. The loops for
                     // a listener are spawned in a row, and a first one that
@@ -788,7 +794,8 @@ pub fn Server(comptime Ctx: type) type {
                     return err;
                 };
                 _ = self.busy.fetchAdd(.{ .count = 1 }, .acq_rel);
-                connections.concurrent(self.io, handleConnectionWrapper, .{ self, l, stream }) catch |err| {
+                // On the executor that accepted it, for its whole life.
+                placement.concurrent(connections, self.io, .local, handleConnectionWrapper, .{ self, l, stream }) catch |err| {
                     log.err("Failed to spawn connection handler: {}", .{err});
                     self.finishRequest();
                     self.releaseConnectionSlot();
