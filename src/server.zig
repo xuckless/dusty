@@ -777,6 +777,16 @@ pub fn Server(comptime Ctx: type) type {
 
             if (cfg.socket_per_acceptor) try checkSocketPerAcceptor(cfg);
 
+            if (cfg.fd) |fd| {
+                if (cfg.socket_per_acceptor) {
+                    log.err("socket_per_acceptor cannot be used with an inherited socket (fd)", .{});
+                    return error.SocketPerAcceptorUnsupported;
+                }
+                l.server = try inheritSocket(self.io, fd, cfg.address);
+                if (l.server.socket.address.getPort() != 0) l.address = .{ .ip = l.server.socket.address };
+                return l;
+            }
+
             l.server = switch (cfg.address) {
                 .ip => |ip| try ip.listen(self.io, .{
                     .kernel_backlog = kernel_backlog,
@@ -806,6 +816,27 @@ pub fn Server(comptime Ctx: type) type {
                 l.extra_servers = extra;
             }
             return l;
+        }
+
+        /// Wraps a listening socket this process did not open. Under zio,
+        /// which drives its own sockets non-blocking, it is made so too.
+        fn inheritSocket(io: std.Io, fd: std.posix.fd_t, configured: Address) !std.Io.net.Server {
+            const c = std.c;
+            if (placement.executorCount(io) != null) {
+                const flags = c.fcntl(fd, c.F.GETFL, @as(c_int, 0));
+                if (flags < 0) return error.InvalidInheritedSocket;
+                _ = c.fcntl(fd, c.F.SETFL, flags | @as(c_int, 1 << @bitOffsetOf(std.posix.O, "NONBLOCK")));
+            }
+            var storage: std.Io.Threaded.PosixAddress = undefined;
+            var len: std.posix.socklen_t = @sizeOf(std.Io.Threaded.PosixAddress);
+            const address: std.Io.net.IpAddress = if (c.getsockname(fd, &storage.any, &len) == 0 and
+                (storage.any.family == std.posix.AF.INET or storage.any.family == std.posix.AF.INET6))
+                std.Io.Threaded.addressFromPosix(&storage)
+            else switch (configured) {
+                .ip => |ip| ip,
+                .unix => .{ .ip4 = .loopback(0) },
+            };
+            return .{ .socket = .{ .handle = fd, .address = address }, .options = {} };
         }
 
         fn checkSocketPerAcceptor(cfg: *const Listener) error{SocketPerAcceptorUnsupported}!void {
