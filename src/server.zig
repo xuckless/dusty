@@ -1100,6 +1100,8 @@ pub fn Server(comptime Ctx: type) type {
 
         fn handleConnection(self: *Self, l: *ActiveListener, stream: std.Io.net.Stream, watch: ?*Watch) !void {
             defer self.releaseConnectionSlot();
+            // The first request's deadlines run from here, handshake included.
+            const accepted_at: std.Io.Clock.Timestamp = .now(self.io, .awake);
 
             // Counted since accept, so a handshake in progress is waited for
             // like a request. Handed back and taken again in `waitForRequest`.
@@ -1171,18 +1173,36 @@ pub fn Server(comptime Ctx: type) type {
                             return h2.Engine(Ctx).serve(self, l.config, true, &connection, &busy);
                         };
                     }
-                    return self.handleRequests(l, &connection, &timer, &busy);
+                    return self.handleRequests(l, &connection, &timer, &busy, accepted_at);
                 }
             }
 
             try connection.initPlain(self.allocator, self.io, stream);
-            return self.handleRequests(l, &connection, &timer, &busy);
+            return self.handleRequests(l, &connection, &timer, &busy, accepted_at);
         }
 
         /// Whether the peer sent, or may still send, input that was not
         /// read: the rest of a body, or a request pipelined behind this one.
         fn hasUnreadInput(connection: *Connection, parser: *RequestParser) bool {
             return !parser.isBodyComplete() or connection.reader.bufferedLen() > 0;
+        }
+
+        /// `start + duration` on the awake clock, or null for no limit.
+        fn deadlineAfter(start: std.Io.Clock.Timestamp, duration: ?std.Io.Duration) ?std.Io.Clock.Timestamp {
+            const d = duration orelse return null;
+            return start.addDuration(.{ .raw = d, .clock = .awake });
+        }
+
+        /// The sooner of two optional deadlines.
+        fn earlier(a: ?std.Io.Clock.Timestamp, b: ?std.Io.Clock.Timestamp) ?std.Io.Clock.Timestamp {
+            const x = a orelse return b;
+            const y = b orelse return a;
+            return if (x.compare(.lt, y)) x else y;
+        }
+
+        /// Arms the timer for `deadline`, or clears it for none.
+        fn armDeadline(self: *Self, timer: *Timer, deadline: ?std.Io.Clock.Timestamp) void {
+            if (deadline) |d| timer.set(self.io, .{ .deadline = d }) else timer.clear(self.io);
         }
 
         /// Cleared when `duration` is unset, so an earlier deadline does not
@@ -1242,6 +1262,7 @@ pub fn Server(comptime Ctx: type) type {
             connection: *Connection,
             timer: *Timer,
             busy: *bool,
+            accepted_at: std.Io.Clock.Timestamp,
         ) !void {
             var idle_read_buffer: [idle_read_buffer_len]u8 = undefined;
             connection.useReadBuffer(&idle_read_buffer);
@@ -1307,7 +1328,14 @@ pub fn Server(comptime Ctx: type) type {
                         return h2.Engine(Ctx).serve(self, l.config, false, connection, busy);
                     }
                 }
-                if (!first) self.armTimer(timer, self.config.timeout.request);
+                // A request runs to `timeout.request` from its arrival (the
+                // first from accept), and its head must arrive within
+                // `timeout.read_header` of the same point, whichever is
+                // sooner; then the request deadline alone applies.
+                const started_at: std.Io.Clock.Timestamp = if (first) accepted_at else .now(self.io, .awake);
+                const request_deadline = deadlineAfter(started_at, self.config.timeout.request);
+                const header_deadline = earlier(deadlineAfter(started_at, self.config.timeout.read_header), request_deadline);
+                self.armDeadline(timer, header_deadline);
                 request_count += 1;
 
                 if (buffers == null) {
@@ -1335,6 +1363,10 @@ pub fn Server(comptime Ctx: type) type {
                     },
                     else => |e| return e,
                 };
+                // The head is in: from here the request deadline alone.
+                if (header_deadline != null and (request_deadline == null or !header_deadline.?.compare(.eq, request_deadline.?))) {
+                    self.armDeadline(timer, request_deadline);
+                }
 
                 // This is per request, not per connection: a keepalive
                 // connection may carry a different forwarding chain on every

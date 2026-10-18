@@ -266,6 +266,13 @@ pub const ServerConfig = struct {
         /// `std.Io.Threaded` setting either timeout means two threads per
         /// connection.
         request: ?std.Io.Duration = .fromSeconds(30),
+        /// Maximum time for a request's head to arrive, counted from the
+        /// same point as `request` (accept for the first request, its first
+        /// byte for later ones): a peer that trickles a request line and
+        /// headers (Slowloris) is cut off sooner than the whole-request
+        /// limit allows. Null leaves the head to `request`. HTTP/1.x only:
+        /// an HTTP/2 stream reaches the server with its head complete.
+        read_header: ?std.Io.Duration = .fromSeconds(10),
         /// Maximum time to keep idle connections open. Defaults to 60 seconds;
         /// set to null to keep them open indefinitely.
         keepalive: ?std.Io.Duration = .fromSeconds(60),
