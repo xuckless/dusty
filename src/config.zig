@@ -375,6 +375,10 @@ pub const ServerConfig = struct {
         /// The Content-Type of a buffered body whose handler set none, as
         /// Fiber does. Null sends such a body without one.
         default_content_type: ?ContentType = .text,
+        /// Most headers a response can carry, those the server adds
+        /// (`Date`, `Content-Encoding`, `Vary`, ...) included. Past it,
+        /// `Response.header` fails with `error.TooManyHeaders`.
+        max_header_count: usize = 64,
     };
 };
 

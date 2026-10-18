@@ -747,7 +747,7 @@ pub fn Engine(comptime Ctx: type) type {
             request.body_source = .{ .reader = &body_reader.interface, .err = BodyReader.errorOf };
 
             var sink_state: StreamSink = .{ .stream = stream };
-            var response = try Response.initSink(arena, io, sink_state.sink(), server.config.request.max_header_count);
+            var response = try Response.initSink(arena, io, sink_state.sink(), server.config.response.max_header_count);
             server.configureResponse(&response);
             defer response.deinit();
             response.request = &request;

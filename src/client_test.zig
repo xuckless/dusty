@@ -769,6 +769,111 @@ test "Client: HTTPS to a listener whose certificate is PEM in memory" {
     try client_future.await(io);
 }
 
+/// One keep-alive request on a TLS connection of the test's own; the
+/// handler answers "ok".
+fn tlsRoundTrip(conn: anytype) !void {
+    var wbuf: [256]u8 = undefined;
+    var w = conn.writer(&wbuf);
+    try w.interface.writeAll("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    try w.interface.flush();
+    var rbuf: [4096]u8 = undefined;
+    var r = conn.reader(&rbuf);
+    const status = try r.interface.takeDelimiterInclusive('\n');
+    try std.testing.expect(std.mem.startsWith(u8, status, "HTTP/1.1 200"));
+    while (true) {
+        const line = try r.interface.takeDelimiterInclusive('\n');
+        if (std.mem.eql(u8, line, "\r\n")) break;
+    }
+    try std.testing.expectEqualStrings("ok", try r.interface.take(2));
+}
+
+test "Server: reloadTls swaps a listener's certificate; open connections keep theirs, a failed reload changes nothing" {
+    if (!build_options.use_tls) return error.SkipZigTest;
+    const tls = @import("tls");
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+
+    const cert_pem = try std.Io.Dir.cwd().readFileAlloc(io, test_cert_path, gpa, .limited(64 * 1024));
+    defer gpa.free(cert_pem);
+    const key_pem = try std.Io.Dir.cwd().readFileAlloc(io, test_key_path, gpa, .limited(64 * 1024));
+    defer gpa.free(key_pem);
+
+    // The caller's configuration, which a reload reads again.
+    var listeners = [_]dusty.Listener{.{ .address = loopback_addr, .tls = .{ .pem = .{ .cert = cert_pem, .key = key_pem } } }};
+    var server = dusty.Server(void).init(gpa, io, .{ .listeners = &listeners }, {});
+    defer server.deinit();
+    server.router.get("/", struct {
+        fn handle(_: *dusty.Request, res: *dusty.Response) !void {
+            res.body = "ok";
+        }
+    }.handle);
+
+    // Not running: only checks that it loads.
+    try server.reloadTls();
+    listeners[0].tls.?.pem.?.key = "not a key";
+    try std.testing.expect(std.meta.isError(server.reloadTls()));
+    listeners[0].tls.?.pem.?.key = key_pem;
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    var client_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void), l: *dusty.Listener, good_key: []const u8, _io: std.Io) !void {
+            try s.ready.wait(_io);
+            const ca: dusty.TlsCa = .{ .file = .{ .path = test_cert_path } };
+            var bundle = try ca.load(std.testing.allocator, _io);
+            defer bundle.deinit(std.testing.allocator);
+
+            // A connection from before the reload.
+            const stream = try s.address.ip.connect(_io, .{ .mode = .stream });
+            defer stream.close(_io);
+            var read_buf: [tls.input_buffer_len]u8 = undefined;
+            var write_buf: [tls.output_buffer_len]u8 = undefined;
+            var tcp_reader = stream.reader(_io, &read_buf);
+            var tcp_writer = stream.writer(_io, &write_buf);
+            var rng: std.Random.IoSource = .{ .io = _io };
+            var conn = try tls.client(&tcp_reader.interface, &tcp_writer.interface, .{
+                .host = "localhost",
+                .root_ca = bundle,
+                .now = std.Io.Clock.real.now(_io),
+                .rng = rng.interface(),
+            });
+            try tlsRoundTrip(&conn);
+
+            try s.reloadTls();
+            // It keeps working, and new connections are served.
+            try tlsRoundTrip(&conn);
+            var client = dusty.Client.init(std.testing.allocator, _io, .{ .tls = .{ .ca = ca } });
+            defer client.deinit();
+            var url_buf: [64]u8 = undefined;
+            const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/", .{s.address.ip.getPort()});
+            {
+                var response = try client.fetch(url, .{});
+                defer response.deinit();
+                try std.testing.expectEqualStrings("ok", (try response.body()).?);
+            }
+
+            // A key that does not load: an error, and the listener
+            // goes on with the one it has.
+            l.tls.?.pem.?.key = "not a key";
+            try std.testing.expect(std.meta.isError(s.reloadTls()));
+            l.tls.?.pem.?.key = good_key;
+            {
+                var response = try client.fetch(url, .{});
+                defer response.deinit();
+                try std.testing.expectEqualStrings("ok", (try response.body()).?);
+            }
+            try tlsRoundTrip(&conn);
+        }
+    }.run, .{ &server, &listeners[0], key_pem, io });
+
+    try client_future.await(io);
+}
+
 test "Server: tls.alpn_protocols is offered to the client through ALPN" {
     if (!build_options.use_tls) return error.SkipZigTest;
     const tls = @import("tls");

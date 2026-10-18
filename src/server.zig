@@ -133,11 +133,78 @@ fn applyForwardedFn(request: *Request, peer: std.Io.net.IpAddress, trusted_proxy
 }
 
 /// Borrowed view of the client-certificate settings, handed to each accepted
-/// connection. The bundle is owned by the Server and outlives every connection.
+/// connection. The bundle is owned by the connection's `TlsMaterial`, which
+/// outlives the connection.
 const ClientAuthRef = struct {
     bundle: *std.crypto.Certificate.Bundle,
     trust: ?*const TrustStore,
     mode: ServerConfig.Tls.ClientAuth.Mode,
+};
+
+/// What every connection accepted on a TLS listener handshakes with: the
+/// certificate and key, and the CAs that verify client certificates.
+/// Reference-counted: the listener holds one reference and each connection
+/// accepted with it another, so `Server.reloadTls` can put a new one in the
+/// listener's place while the connections keep theirs, and the last of them
+/// to close frees it.
+const TlsMaterial = struct {
+    refs: std.atomic.Value(u32) = .init(1),
+    auth: tls.config.CertKeyPair,
+    client_ca: ?std.crypto.Certificate.Bundle = null,
+    client_trust: ?TrustStore = null,
+    client_auth_mode: ServerConfig.Tls.ClientAuth.Mode = .require,
+
+    /// Reads the certificate, key and client CAs `cfg` names (files are
+    /// read now).
+    fn load(allocator: std.mem.Allocator, io: std.Io, cfg: ServerConfig.Tls) !*TlsMaterial {
+        if (cfg.client_auth) |client_auth| if (client_auth.ca == .none) {
+            log.err("tls.client_auth.ca is .none, so no client certificate could ever verify", .{});
+            return error.NoCertificateAuthority;
+        };
+        const dir = cfg.dir orelse std.Io.Dir.cwd();
+        const loaded = if (cfg.pem) |pem|
+            tls.config.CertKeyPair.fromSlice(allocator, io, pem.cert, pem.key)
+        else if (cfg.cert_path.len == 0 or cfg.key_path.len == 0) {
+            log.err("tls needs either pem or both cert_path and key_path", .{});
+            return error.MissingTlsCertificate;
+        } else tls.config.CertKeyPair.fromFilePath(allocator, io, dir, cfg.cert_path, cfg.key_path);
+        var auth = loaded catch |err| {
+            log.err("Failed to load TLS certificate/key: {}", .{err});
+            return err;
+        };
+        errdefer auth.deinit(allocator);
+
+        const m = try allocator.create(TlsMaterial);
+        errdefer allocator.destroy(m);
+        m.* = .{ .auth = auth };
+        if (cfg.client_auth) |client_auth| {
+            m.client_auth_mode = client_auth.mode;
+            m.client_ca = client_auth.ca.load(allocator, io) catch |err| {
+                log.err("Failed to load client certificate authorities: {}", .{err});
+                return err;
+            };
+            errdefer m.client_ca.?.deinit(allocator);
+            if (comptime has_trust_store) m.client_trust = try TrustStore.init(m.client_ca.?);
+        }
+        return m;
+    }
+
+    fn clientAuth(m: *TlsMaterial) ?ClientAuthRef {
+        const bundle = if (m.client_ca) |*b| b else return null;
+        return .{
+            .bundle = bundle,
+            .trust = if (comptime has_trust_store) (if (m.client_trust) |*t| t else null) else null,
+            .mode = m.client_auth_mode,
+        };
+    }
+
+    fn release(m: *TlsMaterial, allocator: std.mem.Allocator) void {
+        if (m.refs.fetchSub(1, .acq_rel) != 1) return;
+        m.auth.deinit(allocator);
+        if (m.client_ca) |*bundle| bundle.deinit(allocator);
+        if (comptime has_trust_store) if (m.client_trust) |*t| t.deinit();
+        allocator.destroy(m);
+    }
 };
 
 /// Primed into each pooled request arena, so an ordinary request is served
@@ -521,6 +588,11 @@ pub fn Server(comptime Ctx: type) type {
         draining: std.Io.Event = .unset,
         _middleware_registry: std.SinglyLinkedList,
         request_buffers: RequestBuffersPool,
+        /// The listeners while `run` serves them, for `reloadTls`; empty
+        /// otherwise. Guarded by `tls_lock`, as is each one's
+        /// `tls_material`.
+        active_listeners: []ActiveListener = &.{},
+        tls_lock: std.atomic.Mutex = .unlocked,
 
         /// A listener while `run` serves it: the socket, and the TLS
         /// material every connection accepted on it shares.
@@ -531,26 +603,16 @@ pub fn Server(comptime Ctx: type) type {
             /// Under `socket_per_acceptor`, the sockets for every accept
             /// loop after the first, which takes `server`.
             extra_servers: []std.Io.net.Server = &.{},
-            tls_auth: ?tls.config.CertKeyPair = null,
-            tls_client_ca: ?std.crypto.Certificate.Bundle = null,
-            tls_client_trust: ?TrustStore = null,
-            client_auth_mode: ServerConfig.Tls.ClientAuth.Mode = .require,
+            /// On a TLS listener, what new connections handshake with.
+            /// `reloadTls` replaces it, so it is read through `acquireTls`,
+            /// under `tls_lock`.
+            tls_material: ?*TlsMaterial = null,
 
             fn freeTls(l: *ActiveListener, allocator: std.mem.Allocator) void {
-                if (build_options.use_tls) {
-                    if (l.tls_auth) |*auth| {
-                        auth.deinit(allocator);
-                        l.tls_auth = null;
-                    }
-                    if (l.tls_client_ca) |*bundle| {
-                        bundle.deinit(allocator);
-                        l.tls_client_ca = null;
-                    }
-                    if (comptime has_trust_store) if (l.tls_client_trust) |*t| {
-                        t.deinit();
-                        l.tls_client_trust = null;
-                    };
-                }
+                if (build_options.use_tls) if (l.tls_material) |m| {
+                    m.release(allocator);
+                    l.tls_material = null;
+                };
             }
 
             fn close(l: *ActiveListener, io: std.Io, allocator: std.mem.Allocator) void {
@@ -694,6 +756,15 @@ pub fn Server(comptime Ctx: type) type {
                 opened += 1;
                 address.* = l.address;
             }
+            // Out of `reloadTls`'s reach before the listeners close.
+            self.lockTls();
+            self.active_listeners = active;
+            self.tls_lock.unlock();
+            defer {
+                self.lockTls();
+                self.active_listeners = &.{};
+                self.tls_lock.unlock();
+            }
             // Grouped by listener, in listener order.
             var next_acceptor: usize = 0;
             for (active) |*l| {
@@ -767,6 +838,64 @@ pub fn Server(comptime Ctx: type) type {
             unreachable;
         }
 
+        fn lockTls(self: *Self) void {
+            while (!self.tls_lock.tryLock()) std.atomic.spinLoopHint();
+        }
+
+        /// A reference to what a new connection on `l` handshakes with, or
+        /// null on a listener without TLS. The caller releases it.
+        fn acquireTls(self: *Self, l: *ActiveListener) ?*TlsMaterial {
+            self.lockTls();
+            defer self.tls_lock.unlock();
+            const m = l.tls_material orelse return null;
+            _ = m.refs.fetchAdd(1, .monotonic);
+            return m;
+        }
+
+        /// Loads every TLS listener's certificate, key and client CAs again
+        /// from its `tls` configuration (reading files again; for `pem`,
+        /// whatever it holds now) and swaps them in. Connections accepted
+        /// from then on handshake with the new ones. Connections already
+        /// accepted, handshakes in progress included, keep the ones they
+        /// started with, which are freed when the last of them closes.
+        ///
+        /// All or nothing: when any listener's fails to load, that error is
+        /// returned and every listener keeps what it had. While the server
+        /// is not running, it only checks that everything loads (`run`
+        /// loads it when it starts). Safe from any task of the server's
+        /// `Io`, concurrently with serving.
+        ///
+        /// What the TLS module must carry from a listener's old certificate
+        /// to its new one, it does in `CertKeyPair.carryOver(new, old)`, if
+        /// it declares that: BoringSSL's adapter keeps the session ticket
+        /// keys, so tickets issued before a reload still resume.
+        pub fn reloadTls(self: *Self) !void {
+            if (!build_options.use_tls) return;
+            const listeners = self.configuredListeners();
+            const loaded = try self.allocator.alloc(?*TlsMaterial, listeners.len);
+            defer self.allocator.free(loaded);
+            @memset(loaded, null);
+            defer for (loaded) |m| if (m) |x| x.release(self.allocator);
+            for (listeners, loaded) |*cfg, *slot| {
+                const tls_cfg = cfg.tls orelse continue;
+                slot.* = try TlsMaterial.load(self.allocator, self.io, tls_cfg);
+            }
+
+            // Swapped in one go, so no listener serves the old material
+            // after another has the new. What each had is released below
+            // (in `loaded`'s place), outside the lock.
+            self.lockTls();
+            defer self.tls_lock.unlock();
+            if (self.active_listeners.len != listeners.len) return;
+            for (self.active_listeners, loaded) |*l, *slot| {
+                const new = slot.* orelse continue;
+                const old = l.tls_material orelse continue;
+                if (comptime @hasDecl(tls.config.CertKeyPair, "carryOver")) new.auth.carryOver(&old.auth);
+                l.tls_material = new;
+                slot.* = old;
+            }
+        }
+
         fn configuredListeners(self: *const Self) []const Listener {
             return if (self.config.listeners.len == 0) &default_listeners else self.config.listeners;
         }
@@ -787,41 +916,7 @@ pub fn Server(comptime Ctx: type) type {
                         return error.Http2NotConfigured;
                     };
                 }
-                if (tls_cfg.client_auth) |client_auth| {
-                    if (client_auth.ca == .none) {
-                        log.err("tls.client_auth.ca is .none, so no client certificate could ever verify", .{});
-                        return error.NoCertificateAuthority;
-                    }
-                    l.client_auth_mode = client_auth.mode;
-                }
-
-                const dir = tls_cfg.dir orelse std.Io.Dir.cwd();
-                const loaded = if (tls_cfg.pem) |pem|
-                    tls.config.CertKeyPair.fromSlice(self.allocator, self.io, pem.cert, pem.key)
-                else if (tls_cfg.cert_path.len == 0 or tls_cfg.key_path.len == 0) {
-                    log.err("tls needs either pem or both cert_path and key_path", .{});
-                    return error.MissingTlsCertificate;
-                } else tls.config.CertKeyPair.fromFilePath(
-                    self.allocator,
-                    self.io,
-                    dir,
-                    tls_cfg.cert_path,
-                    tls_cfg.key_path,
-                );
-                l.tls_auth = loaded catch |err| {
-                    log.err("Failed to load TLS certificate/key: {}", .{err});
-                    return err;
-                };
-
-                if (tls_cfg.client_auth) |client_auth| {
-                    l.tls_client_ca = client_auth.ca.load(self.allocator, self.io) catch |err| {
-                        log.err("Failed to load client certificate authorities: {}", .{err});
-                        return err;
-                    };
-                    if (comptime has_trust_store) {
-                        l.tls_client_trust = try TrustStore.init(l.tls_client_ca.?);
-                    }
-                }
+                l.tls_material = try TlsMaterial.load(self.allocator, self.io, tls_cfg);
             }
 
             if (cfg.socket_per_acceptor) try checkSocketPerAcceptor(cfg);
@@ -1317,6 +1412,12 @@ pub fn Server(comptime Ctx: type) type {
                 };
             }
 
+            // What this connection handshakes with, held until it closes
+            // (after `connection.deinit`), whatever `reloadTls` swaps in
+            // meanwhile.
+            const material: ?*TlsMaterial = if (build_options.use_tls) self.acquireTls(l) else null;
+            defer if (material) |m| m.release(self.allocator);
+
             var connection: Connection = undefined;
             defer connection.deinit();
 
@@ -1324,7 +1425,7 @@ pub fn Server(comptime Ctx: type) type {
             // the request loop over the cleartext reader/writer. Otherwise
             // run it directly over the raw stream.
             if (build_options.use_tls) {
-                if (l.tls_auth) |*auth| {
+                if (material) |m| {
                     // The handshake is the one part of a connection's life
                     // the request loop's timeout cannot cover, since that
                     // loop does not exist yet. A peer that opens a socket
@@ -1336,13 +1437,7 @@ pub fn Server(comptime Ctx: type) type {
                         defer timer.clear(self.io);
                         self.armTimer(&timer, self.config.timeout.request);
 
-                        const client_auth: ?ClientAuthRef = if (l.tls_client_ca) |*bundle| .{
-                            .bundle = bundle,
-                            .trust = if (l.tls_client_trust) |*t| t else null,
-                            .mode = l.client_auth_mode,
-                        } else null;
-
-                        connection.initTls(self.allocator, self.io, stream, auth, client_auth, l.config.tls.?.alpn_protocols) catch |err| {
+                        connection.initTls(self.allocator, self.io, stream, &m.auth, m.clientAuth(), l.config.tls.?.alpn_protocols) catch |err| {
                             // tls.zig only saw the ciphertext reader or
                             // writer fail generically, so the cause is a
                             // layer down -- and when the handshake ran out
@@ -1509,7 +1604,7 @@ pub fn Server(comptime Ctx: type) type {
                 .config = self.config.request,
                 .remote_address = connection.peerAddress(),
                 .listener = l.config,
-                .secure = (build_options.use_tls and l.tls_auth != null) or connection.proxied_secure,
+                .secure = (build_options.use_tls and l.config.tls != null) or connection.proxied_secure,
                 .drain = &self.draining,
                 .peer_certificate = connection.peerCertificate(),
                 ._timeout_context = timer,
@@ -1550,7 +1645,7 @@ pub fn Server(comptime Ctx: type) type {
                 }
                 // Cleartext HTTP/2 with prior knowledge: the first bytes are
                 // the HTTP/2 preface rather than a request line.
-                if (build_options.use_http2 and first and l.config.http2_prior_knowledge and !(build_options.use_tls and l.tls_auth != null)) {
+                if (build_options.use_http2 and first and l.config.http2_prior_knowledge and !(build_options.use_tls and l.config.tls != null)) {
                     const is_h2 = h2.sniffPreface(connection.reader) catch
                         return connection.getReadError() orelse error.Unexpected;
                     if (is_h2) {
@@ -1603,12 +1698,12 @@ pub fn Server(comptime Ctx: type) type {
                 // request. Starting from the socket peer also makes an absent
                 // or invalid chain fail closed instead of retaining the last
                 // request's forwarded address.
-                request.secure = (build_options.use_tls and l.tls_auth != null) or connection.proxied_secure;
+                request.secure = (build_options.use_tls and l.config.tls != null) or connection.proxied_secure;
                 applyForwardedFn(&request, connection.peerAddress(), self.config.trusted_proxy_hops);
 
                 log.debug("Received: {f} {s}", .{ request.method, request.url });
 
-                var response = try Response.init(request.arena, connection, self.config.request.max_header_count);
+                var response = try Response.init(request.arena, connection, self.config.response.max_header_count);
                 self.configureResponse(&response);
                 defer response.deinit();
                 response.head = request.method == .head;
