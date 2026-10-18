@@ -1354,6 +1354,7 @@ pub fn Server(comptime Ctx: type) type {
                 .ctx = self.ctx,
                 .action = if (found) |r| r.action else null,
                 .middlewares = if (found) |r| r.middlewares else self.router.middlewares,
+                .allow = if (found == null) try self.router.allowedMethods(req) else null,
             };
             try executor.run();
         }
@@ -1552,6 +1553,7 @@ pub fn Server(comptime Ctx: type) type {
                     .ctx = self.ctx,
                     .action = if (found) |r| r.action else null,
                     .middlewares = if (found) |r| r.middlewares else self.router.middlewares,
+                    .allow = if (found == null) try self.router.allowedMethods(&request) else null,
                 };
                 executor.run() catch |err| switch (err) {
                     error.ReadFailed => return connection.getReadError() orelse error.Unexpected,

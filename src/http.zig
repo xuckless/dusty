@@ -716,6 +716,20 @@ pub const ContentType = enum(u32) {
     ttf,
     wasm,
     pdf,
+    avif,
+    bmp,
+    otf,
+    csv,
+    markdown,
+    manifest,
+    calendar,
+    rss,
+    atom,
+    zip,
+    mov,
+    m4a,
+    aac,
+    flac,
     event_stream,
     form,
     multipart_form,
@@ -818,6 +832,23 @@ pub const ContentType = enum(u32) {
         if ((hash == comptime std.hash.Fnv1a_32.hash("ttf")) and std.mem.eql(u8, name, "ttf")) return .ttf;
         if ((hash == comptime std.hash.Fnv1a_32.hash("wasm")) and std.mem.eql(u8, name, "wasm")) return .wasm;
         if ((hash == comptime std.hash.Fnv1a_32.hash("pdf")) and std.mem.eql(u8, name, "pdf")) return .pdf;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("cjs")) and std.mem.eql(u8, name, "cjs")) return .js;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("map")) and std.mem.eql(u8, name, "map")) return .json;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("yml")) and std.mem.eql(u8, name, "yml")) return .yaml;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("avif")) and std.mem.eql(u8, name, "avif")) return .avif;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("bmp")) and std.mem.eql(u8, name, "bmp")) return .bmp;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("otf")) and std.mem.eql(u8, name, "otf")) return .otf;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("csv")) and std.mem.eql(u8, name, "csv")) return .csv;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("md")) and std.mem.eql(u8, name, "md")) return .markdown;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("webmanifest")) and std.mem.eql(u8, name, "webmanifest")) return .manifest;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("ics")) and std.mem.eql(u8, name, "ics")) return .calendar;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("rss")) and std.mem.eql(u8, name, "rss")) return .rss;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("atom")) and std.mem.eql(u8, name, "atom")) return .atom;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("zip")) and std.mem.eql(u8, name, "zip")) return .zip;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("mov")) and std.mem.eql(u8, name, "mov")) return .mov;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("m4a")) and std.mem.eql(u8, name, "m4a")) return .m4a;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("aac")) and std.mem.eql(u8, name, "aac")) return .aac;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("flac")) and std.mem.eql(u8, name, "flac")) return .flac;
 
         return .unknown;
     }
@@ -848,6 +879,20 @@ pub const ContentType = enum(u32) {
             .ttf => "font/ttf",
             .wasm => "application/wasm",
             .pdf => "application/pdf",
+            .avif => "image/avif",
+            .bmp => "image/bmp",
+            .otf => "font/otf",
+            .csv => "text/csv; charset=UTF-8",
+            .markdown => "text/markdown; charset=UTF-8",
+            .manifest => "application/manifest+json",
+            .calendar => "text/calendar; charset=UTF-8",
+            .rss => "application/rss+xml",
+            .atom => "application/atom+xml",
+            .zip => "application/zip",
+            .mov => "video/quicktime",
+            .m4a => "audio/mp4",
+            .aac => "audio/aac",
+            .flac => "audio/flac",
             .event_stream => "text/event-stream",
             .form => "application/x-www-form-urlencoded",
             .multipart_form => "multipart/form-data",
@@ -940,7 +985,15 @@ pub fn acceptsGzip(headers: *const Headers) bool {
 /// `acceptsGzip` for any content coding, by its registered name. `x-gzip`
 /// counts as gzip.
 pub fn acceptsEncoding(headers: *const Headers, name: []const u8) bool {
-    var wildcard = false;
+    return encodingQuality(headers, name) > 0;
+}
+
+/// The quality `Accept-Encoding` gives a content coding, in thousandths
+/// (RFC 9110 §12.4.2): 1000 when listed without `q`, 0 when refused or not
+/// listed. `*` stands in for a coding not named; `x-gzip` for gzip. A
+/// malformed `q` counts as 1, as most servers read it.
+pub fn encodingQuality(headers: *const Headers, name: []const u8) u16 {
+    var wildcard: u16 = 0;
     var fields = headers.iterator();
     while (fields.next()) |field| {
         if (!std.ascii.eqlIgnoreCase(field.key, "Accept-Encoding")) continue;
@@ -948,28 +1001,45 @@ pub fn acceptsEncoding(headers: *const Headers, name: []const u8) bool {
         while (it.next()) |item| {
             var parts = std.mem.splitScalar(u8, item, ';');
             const coding = std.mem.trim(u8, parts.first(), " \t");
-            var accepted = true;
+            var quality: u16 = 1000;
             while (parts.next()) |part| {
                 const param = std.mem.trim(u8, part, " \t");
                 if (param.len >= 2 and (param[0] == 'q' or param[0] == 'Q') and param[1] == '=') {
-                    accepted = !isZeroQuality(std.mem.trim(u8, param[2..], " \t"));
+                    quality = parseQuality(std.mem.trim(u8, param[2..], " \t"));
                 }
             }
-            if (std.ascii.eqlIgnoreCase(coding, name)) return accepted;
-            if (std.ascii.eqlIgnoreCase(name, "gzip") and std.ascii.eqlIgnoreCase(coding, "x-gzip")) return accepted;
-            if (std.mem.eql(u8, coding, "*")) wildcard = accepted;
+            if (std.ascii.eqlIgnoreCase(coding, name)) return quality;
+            if (std.ascii.eqlIgnoreCase(name, "gzip") and std.ascii.eqlIgnoreCase(coding, "x-gzip")) return quality;
+            if (std.mem.eql(u8, coding, "*")) wildcard = quality;
         }
     }
     return wildcard;
 }
 
-/// "0", "0.", "0.0" up to "0.000".
-fn isZeroQuality(value: []const u8) bool {
-    if (value.len == 0 or value[0] != '0') return false;
-    if (value.len == 1) return true;
-    if (value[1] != '.') return false;
-    for (value[2..]) |ch| if (ch != '0') return false;
-    return true;
+/// A `qvalue` ("0", "0.5", "1.000") in thousandths.
+fn parseQuality(value: []const u8) u16 {
+    if (value.len == 0 or value.len > 5 or value[0] != '0') return 1000;
+    if (value.len == 1) return 0;
+    if (value[1] != '.') return 1000;
+    var q: u16 = 0;
+    var scale: u16 = 100;
+    for (value[2..]) |ch| {
+        if (!std.ascii.isDigit(ch)) return 1000;
+        q += (ch - '0') * scale;
+        scale /= 10;
+    }
+    return q;
+}
+
+test "encodingQuality: q-values, wildcard and refusal" {
+    var headers = try Headers.init(std.testing.allocator, 4);
+    defer headers.deinit(std.testing.allocator);
+    try headers.add("Accept-Encoding", "gzip;q=1.0, zstd;q=0.25, br;q=0, *;q=0.1");
+    try std.testing.expectEqual(@as(u16, 1000), encodingQuality(&headers, "gzip"));
+    try std.testing.expectEqual(@as(u16, 250), encodingQuality(&headers, "zstd"));
+    try std.testing.expectEqual(@as(u16, 0), encodingQuality(&headers, "br"));
+    try std.testing.expectEqual(@as(u16, 100), encodingQuality(&headers, "deflate"));
+    try std.testing.expect(!acceptsEncoding(&headers, "br"));
 }
 
 fn testAcceptsGzip(values: []const []const u8) !bool {

@@ -300,3 +300,47 @@ test "embedded: a compressed copy is served to a client that accepts it" {
     try std.testing.expectEqualStrings("Accept-Encoding", header(plain, "Vary").?);
     try std.testing.expectEqualStrings("body { color: red }", body(plain));
 }
+
+test "static: the client's q-values pick the precompressed copy, and Cache-Control goes out" {
+    const io = std.testing.io;
+    var tmp = try testDir();
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "style.css.gz", .data = "gzipped" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "style.css.br", .data = "brotli" });
+    const opts: dusty.StaticOptions = .{ .precompressed = &.{ .br, .gzip }, .cache_control = "public, max-age=60" };
+
+    var out: [4096]u8 = undefined;
+    // br is preferred by the server, but the client rates gzip higher.
+    const gz = try exchange(tmp.dir, "/", opts, "GET /style.css HTTP/1.1\r\nHost: x\r\nAccept-Encoding: br;q=0.5, gzip\r\nConnection: close\r\n\r\n", &out);
+    try std.testing.expectEqualStrings("gzip", header(gz, "Content-Encoding").?);
+    try std.testing.expectEqualStrings("public, max-age=60", header(gz, "Cache-Control").?);
+    // A tie goes to the server's order.
+    const br = try exchange(tmp.dir, "/", opts, "GET /style.css HTTP/1.1\r\nHost: x\r\nAccept-Encoding: gzip, br\r\nConnection: close\r\n\r\n", &out);
+    try std.testing.expectEqualStrings("br", header(br, "Content-Encoding").?);
+    // Not on a 416.
+    const range = try exchange(tmp.dir, "/", opts, "GET /style.css HTTP/1.1\r\nHost: x\r\nRange: bytes=900-\r\nConnection: close\r\n\r\n", &out);
+    try std.testing.expect(std.mem.startsWith(u8, range, "HTTP/1.1 416"));
+    try std.testing.expectEqual(null, header(range, "Cache-Control"));
+}
+
+test "static: newer web types have their media types" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cases = [_][2][]const u8{
+        .{ "a.avif", "image/avif" },
+        .{ "a.webmanifest", "application/manifest+json" },
+        .{ "a.js.map", "application/json; charset=UTF-8" },
+        .{ "a.otf", "font/otf" },
+        .{ "a.csv", "text/csv; charset=UTF-8" },
+        .{ "a.md", "text/markdown; charset=UTF-8" },
+    };
+    for (cases) |case| try tmp.dir.writeFile(io, .{ .sub_path = case[0], .data = "x" });
+    var out: [4096]u8 = undefined;
+    for (cases) |case| {
+        var req_buf: [128]u8 = undefined;
+        const req = try std.fmt.bufPrint(&req_buf, "GET /{s} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", .{case[0]});
+        const resp = try exchange(tmp.dir, "/", .{}, req, &out);
+        try std.testing.expectEqualStrings(case[1], header(resp, "Content-Type").?);
+    }
+}

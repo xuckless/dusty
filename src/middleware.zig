@@ -72,6 +72,10 @@ pub fn Executor(comptime Ctx: type) type {
         ctx: if (Ctx == void) void else *Ctx,
         action: ?Action(Ctx),
         middlewares: []const Middleware(Ctx),
+        /// With no route for the request's method, the methods that do
+        /// have one for its path (`Router.allowedMethods`): the miss is a
+        /// 405 with this `Allow` rather than a 404.
+        allow: ?[]const u8 = null,
 
         pub fn run(self: *Self) !void {
             self.next() catch |err| switch (err) {
@@ -119,7 +123,10 @@ pub fn Executor(comptime Ctx: type) type {
             }
 
             // All middlewares executed, call dispatcher or handler
-            const action = self.action orelse return self.handleNotFound();
+            const action = self.action orelse {
+                if (self.allow) |allow| return self.handleMethodNotAllowed(allow);
+                return self.handleNotFound();
+            };
             const result = if (comptime Ctx != void and @hasDecl(Ctx, "dispatch"))
                 self.ctx.dispatch(action, self.req, self.res)
             else if (comptime Ctx == void)
@@ -132,6 +139,18 @@ pub fn Executor(comptime Ctx: type) type {
                 error.NotFound => return self.handleNotFound(),
                 else => return err,
             };
+        }
+
+        fn handleMethodNotAllowed(self: *Self, allow: []const u8) !void {
+            if (!self.res.headers_written) self.res.resetBody();
+            try self.res.header("Allow", allow);
+            if (comptime Ctx != void and @hasDecl(Ctx, "methodNotAllowed")) {
+                try self.ctx.methodNotAllowed(self.req, self.res);
+            } else {
+                self.res.status = .method_not_allowed;
+                self.res.content_type = .text;
+                self.res.body = "405 Method Not Allowed\n";
+            }
         }
 
         fn handleNotFound(self: *Self) !void {

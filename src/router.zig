@@ -344,6 +344,47 @@ pub fn Router(comptime Ctx: type) type {
             return null;
         }
 
+        /// The methods with a route for `req`'s path, as an `Allow` value
+        /// ("GET, HEAD, POST"), when there is none for its own method.
+        /// Null when no method has one either: a 404, not a 405. For
+        /// the miss path only, after `findHandler` came up empty; it
+        /// leaves `req.params` empty.
+        pub fn allowedMethods(self: *const Self, req: *Request) !?[]const u8 {
+            const path = if (std.mem.indexOfScalar(u8, req.url, '?')) |q| req.url[0..q] else req.url;
+            const max_segments = std.mem.count(u8, path, "/") + 1;
+            const segments = try req.arena.alloc([]const u8, max_segments);
+            const offsets = try req.arena.alloc(usize, max_segments);
+            var n: usize = 0;
+            var offset: usize = 0;
+            var iter = std.mem.splitScalar(u8, path, '/');
+            while (iter.next()) |segment| {
+                if (segment.len > 0) {
+                    segments[n] = segment;
+                    offsets[n] = offset;
+                    n += 1;
+                }
+                offset += segment.len + 1;
+            }
+            defer req.params.map.clearRetainingCapacity();
+
+            var allow: std.ArrayList(u8) = .empty;
+            var has_get = false;
+            var has_head = false;
+            for (std.enums.values(Method)) |m| {
+                if (m == req.method) continue;
+                req.params.map.clearRetainingCapacity();
+                const route = self.matchIn(m, req, path, segments[0..n], offsets[0..n]) catch continue;
+                if (route == null) continue;
+                if (m == .get) has_get = true;
+                if (m == .head) has_head = true;
+                if (allow.items.len > 0) try allow.appendSlice(req.arena, ", ");
+                try allow.print(req.arena, "{f}", .{m});
+            }
+            // A GET route answers HEAD too (see `findHandler`).
+            if (has_get and !has_head and req.method != .head) try allow.appendSlice(req.arena, ", HEAD");
+            return if (allow.items.len == 0) null else allow.items;
+        }
+
         fn matchIn(
             self: *const Self,
             method: ?Method,
@@ -414,6 +455,7 @@ pub fn Router(comptime Ctx: type) type {
             files.* = .{ .dir = dir, .options = opts };
             if (opts.index) |index| files.options.index = alloc.dupe(u8, index) catch @panic("OOM");
             files.options.precompressed = alloc.dupe(Precompressed, opts.precompressed) catch @panic("OOM");
+            if (opts.cache_control) |cc| files.options.cache_control = alloc.dupe(u8, cc) catch @panic("OOM");
             const base = std.mem.trimEnd(u8, prefix, "/");
             // The directory itself, for its index.
             self.insertRoute(if (base.len == 0) "/" else base, .get, staticAction, middlewares, files) catch @panic("OOM");
