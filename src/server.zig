@@ -24,6 +24,7 @@ const Watch = @import("deadline.zig").Watch;
 const Timer = @import("deadline.zig").Timer;
 const placement = @import("placement.zig");
 /// The HTTP/2 engine, with the `use_http2` build option.
+const proxy_protocol = @import("proxy_protocol.zig");
 const h2 = if (build_options.use_http2) @import("server/h2.zig") else struct {};
 const MiddlewareConfig = @import("middleware.zig").MiddlewareConfig;
 const cgroup = @import("cgroup.zig");
@@ -92,6 +93,42 @@ fn remoteAddress(peer: std.Io.net.IpAddress, headers: *const Headers, trusted_pr
     return forwardedRemoteAddress(headers, trusted_proxy_hops) orelse peer;
 }
 
+/// The last value of a comma-separated forwarding header: the one the
+/// nearest proxy wrote or appended. Null when absent or empty.
+fn lastForwardedValue(headers: *const Headers, name: []const u8) ?[]const u8 {
+    var last: ?[]const u8 = null;
+    var it = headers.iterator();
+    while (it.next()) |header| {
+        if (!std.ascii.eqlIgnoreCase(header.key, name)) continue;
+        var values = std.mem.splitScalar(u8, header.value, ',');
+        while (values.next()) |v| last = std.mem.trim(u8, v, " \t");
+    }
+    const value = last orelse return null;
+    return if (value.len == 0) null else value;
+}
+
+/// Applies what trusted proxies say about a request: its client address
+/// (`X-Forwarded-For`), whether the client's connection is TLS
+/// (`X-Forwarded-Proto`) and the host it asked for (`X-Forwarded-Host`).
+/// With no trusted hops, only the peer address applies.
+fn applyForwardedFn(request: *Request, peer: std.Io.net.IpAddress, trusted_proxy_hops: usize) void {
+    request.remote_address = remoteAddress(peer, &request.headers, trusted_proxy_hops);
+    request.forwarded_host = null;
+    if (trusted_proxy_hops == 0) return;
+    if (lastForwardedValue(&request.headers, "X-Forwarded-Proto")) |proto| {
+        if (std.ascii.eqlIgnoreCase(proto, "https")) request.secure = true;
+        if (std.ascii.eqlIgnoreCase(proto, "http")) request.secure = false;
+    }
+    if (lastForwardedValue(&request.headers, "X-Forwarded-Host")) |host| {
+        // A host name or address with an optional port: nothing that could
+        // break a URL or a log line built from it.
+        const ok = host.len <= 255 and for (host) |ch| {
+            if (!(std.ascii.isAlphanumeric(ch) or std.mem.indexOfScalar(u8, ".-:[]_", ch) != null)) break false;
+        } else true;
+        if (ok) request.forwarded_host = host;
+    }
+}
+
 /// Borrowed view of the client-certificate settings, handed to each accepted
 /// connection. The bundle is owned by the Server and outlives every connection.
 const ClientAuthRef = struct {
@@ -142,6 +179,11 @@ pub const Connection = struct {
     // them, and tls_reader/tls_writer expose the cleartext Reader/Writer used
     // for HTTP I/O.
     tls_conn: ?tls.Connection = null,
+    /// What a PROXY protocol header said, on a `Listener.proxy_protocol`
+    /// listener: the client address, and whether the client spoke TLS to
+    /// the proxy.
+    proxied_peer: ?std.Io.net.IpAddress = null,
+    proxied_secure: bool = false,
     tls_rng: std.Random.IoSource = undefined,
     tls_reader: tls.Connection.Reader = undefined,
     tls_writer: tls.Connection.Writer = undefined,
@@ -354,6 +396,12 @@ pub const Connection = struct {
     /// is gone. Asked instead of judging an error by its name: a handler's
     /// own `EndOfStream`, from a file or from a std helper at the end of
     /// the body, is spelled like a disconnect and is not one.
+    /// The client's address: the socket peer, or what a PROXY protocol
+    /// header named.
+    pub fn peerAddress(self: *const Connection) std.Io.net.IpAddress {
+        return self.proxied_peer orelse self.stream.socket.address;
+    }
+
     pub fn peerGone(self: *Connection) bool {
         if (self.getWriteError()) |e| if (isPeerGone(e)) return true;
         if (self.getReadError()) |e| if (isPeerGone(e)) return true;
@@ -1140,11 +1188,28 @@ pub fn Server(comptime Ctx: type) type {
 
             defer stream.close(self.io);
 
-            var connection: Connection = undefined;
-            defer connection.deinit();
-
             var timer: Timer = .init(watch);
             defer timer.clear(self.io);
+
+            // The PROXY protocol header comes first, ahead of TLS.
+            var proxied: proxy_protocol.Header = .{};
+            if (l.config.proxy_protocol) {
+                defer timer.clear(self.io);
+                self.armDeadline(&timer, earlier(
+                    deadlineAfter(accepted_at, self.config.timeout.read_header),
+                    deadlineAfter(accepted_at, self.config.timeout.request),
+                ));
+                proxied = proxy_protocol.read(self.io, stream) catch |err| switch (err) {
+                    error.Canceled => return error.Canceled,
+                    else => {
+                        log.info("PROXY protocol header refused: {}", .{err});
+                        return;
+                    },
+                };
+            }
+
+            var connection: Connection = undefined;
+            defer connection.deinit();
 
             // When the listener is TLS, upgrade the accepted stream and run
             // the request loop over the cleartext reader/writer. Otherwise
@@ -1198,6 +1263,8 @@ pub fn Server(comptime Ctx: type) type {
                         };
                     }
 
+                    connection.proxied_peer = proxied.source;
+                    connection.proxied_secure = proxied.ssl;
                     if (build_options.use_http2) {
                         if (connection.negotiatedProtocol()) |p| if (std.mem.eql(u8, p, "h2")) {
                             return h2.Engine(Ctx).serve(self, l.config, true, &connection, &busy);
@@ -1208,6 +1275,8 @@ pub fn Server(comptime Ctx: type) type {
             }
 
             try connection.initPlain(self.allocator, self.io, stream);
+            connection.proxied_peer = proxied.source;
+            connection.proxied_secure = proxied.ssl;
             return self.handleRequests(l, &connection, &timer, &busy, accepted_at);
         }
 
@@ -1256,6 +1325,13 @@ pub fn Server(comptime Ctx: type) type {
         /// through `X-Forwarded-For` as far as `trusted_proxy_hops` allows.
         pub fn clientAddress(self: *const Self, peer: std.Io.net.IpAddress, headers: *const Headers) std.Io.net.IpAddress {
             return remoteAddress(peer, headers, self.config.trusted_proxy_hops);
+        }
+
+        /// `remote_address`, `secure` and `forwarded_host` for a request
+        /// from `connection`, through the trusted proxies, for an engine
+        /// other than the HTTP/1.x loop.
+        pub fn applyForwarded(self: *const Self, request: *Request, connection: *const Connection) void {
+            applyForwardedFn(request, connection.peerAddress(), self.config.trusted_proxy_hops);
         }
 
         /// Routes `req` and runs its handler, with the middleware, writing to
@@ -1309,9 +1385,9 @@ pub fn Server(comptime Ctx: type) type {
                 .transport = connection.transport(),
                 .parser = undefined,
                 .config = self.config.request,
-                .remote_address = connection.stream.socket.address,
+                .remote_address = connection.peerAddress(),
                 .listener = l.config,
-                .secure = build_options.use_tls and l.tls_auth != null,
+                .secure = (build_options.use_tls and l.tls_auth != null) or connection.proxied_secure,
                 ._timeout_context = timer,
                 ._set_timeout = setRequestTimeout,
             };
@@ -1350,7 +1426,7 @@ pub fn Server(comptime Ctx: type) type {
                 }
                 // Cleartext HTTP/2 with prior knowledge: the first bytes are
                 // the HTTP/2 preface rather than a request line.
-                if (build_options.use_http2 and first and l.config.http2_prior_knowledge and !request.secure) {
+                if (build_options.use_http2 and first and l.config.http2_prior_knowledge and !(build_options.use_tls and l.tls_auth != null)) {
                     const is_h2 = h2.sniffPreface(connection.reader) catch
                         return connection.getReadError() orelse error.Unexpected;
                     if (is_h2) {
@@ -1403,11 +1479,8 @@ pub fn Server(comptime Ctx: type) type {
                 // request. Starting from the socket peer also makes an absent
                 // or invalid chain fail closed instead of retaining the last
                 // request's forwarded address.
-                request.remote_address = remoteAddress(
-                    connection.stream.socket.address,
-                    &request.headers,
-                    self.config.trusted_proxy_hops,
-                );
+                request.secure = (build_options.use_tls and l.tls_auth != null) or connection.proxied_secure;
+                applyForwardedFn(&request, connection.peerAddress(), self.config.trusted_proxy_hops);
 
                 log.debug("Received: {f} {s}", .{ request.method, request.url });
 

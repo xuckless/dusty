@@ -50,8 +50,13 @@ pub const Request = struct {
     /// `ServerConfig.listeners`, so a handler can compare it against them or
     /// read its address. A placeholder in a request the server did not build.
     listener: *const Listener = &placeholder_listener,
-    /// Whether the connection is TLS.
+    /// Whether the client's connection is TLS: this server's, or, behind a
+    /// trusted proxy, the proxy's (PROXY protocol v2's SSL TLV, or
+    /// `X-Forwarded-Proto` under `ServerConfig.trusted_proxy_hops`).
     secure: bool = false,
+    /// `X-Forwarded-Host` from the nearest trusted proxy, under
+    /// `ServerConfig.trusted_proxy_hops`. See `host`.
+    forwarded_host: ?[]const u8 = null,
     /// This request's ID, set by the RequestId middleware: for log lines,
     /// traces and error reports. Empty without it.
     id: []const u8 = "",
@@ -87,6 +92,12 @@ pub const Request = struct {
     // 100-continue support
     response: ?*Response = null,
     expects_continue: bool = false,
+
+    /// The host the client asked for: `X-Forwarded-Host` from a trusted
+    /// proxy, else `Host` (which HTTP/2's `:authority` fills).
+    pub fn host(self: *const Request) ?[]const u8 {
+        return self.forwarded_host orelse self.headers.get("Host");
+    }
 
     pub fn reset(self: *Request) void {
         const arena = self.arena;
