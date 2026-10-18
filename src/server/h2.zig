@@ -667,6 +667,7 @@ pub fn Engine(comptime Ctx: type) type {
                 .config = server.config.request,
                 .listener = conn.listener,
                 .secure = conn.secure,
+                .peer_certificate = conn.connection.peerCertificate(),
                 .version_major = 2,
                 .version_minor = 0,
                 .drain = &server.draining,
