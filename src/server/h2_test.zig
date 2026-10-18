@@ -43,6 +43,8 @@ const TestClient = struct {
         /// The request body to send, if any.
         send: []const u8 = "",
         sent: usize = 0,
+        /// Never end the request side (a tunnel the peer keeps open).
+        keep_open: bool = false,
     };
 
     fn init(self: *TestClient, gpa: std.mem.Allocator, io: std.Io, addr: std.Io.net.IpAddress) !void {
@@ -239,7 +241,11 @@ const TestClient = struct {
         const n = @min(rest.len, length);
         @memcpy(buf[0..n], rest[0..n]);
         resp.sent += n;
-        if (resp.sent == resp.send.len) flags.* |= c.NGHTTP2_DATA_FLAG_EOF;
+        if (resp.sent == resp.send.len) {
+            if (resp.keep_open) {
+                if (n == 0) return c.NGHTTP2_ERR_DEFERRED;
+            } else flags.* |= c.NGHTTP2_DATA_FLAG_EOF;
+        }
         return @intCast(n);
     }
 };
@@ -661,4 +667,61 @@ test "HTTP/2: an extended CONNECT (RFC 8441) reaches a GET route with Request.pr
     try client.run();
     try std.testing.expectEqual(@as(u16, 200), client.get(id).status);
     try std.testing.expectEqualStrings("tunnelled bytes", client.get(id).body.items);
+}
+
+test "HTTP/2: a client that half-closes still gets the responses in flight" {
+    const io = std.testing.io;
+    var fx: Fixture = undefined;
+    try fx.start(io);
+    defer fx.stop(io);
+
+    var client: TestClient = undefined;
+    try client.init(std.testing.allocator, io, fx.server.address.ip);
+    defer client.deinit();
+    const id = try client.request("GET", "/slow", null);
+    while (true) {
+        var data: [*c]const u8 = undefined;
+        const n = c.nghttp2_session_mem_send2(client.session, &data);
+        if (n <= 0) break;
+        try client.w.writeAll(data[0..@intCast(n)]);
+    }
+    try client.w.flush();
+    // Done sending: the server reads EOF while /slow is still sleeping.
+    try client.stream.shutdown(io, .send);
+    // Nothing more goes out from here; read until the response is in.
+    while (!client.get(id).closed) {
+        const bytes = try client.r.peekGreedy(1);
+        const rv = c.nghttp2_session_mem_recv2(client.session, bytes.ptr, bytes.len);
+        if (rv < 0) return error.Http2Recv;
+        client.r.toss(@intCast(rv));
+    }
+    try std.testing.expectEqual(@as(u16, 200), client.get(id).status);
+    try std.testing.expectEqualStrings("slow but whole", client.get(id).body.items);
+}
+
+test "HTTP/2: a finished tunnel is reset even when the peer keeps its side open" {
+    const io = std.testing.io;
+    var fx: Fixture = undefined;
+    try fx.start(io);
+    defer fx.stop(io);
+    fx.server.router.get("/brief", struct {
+        fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+            _ = req;
+            res.body = "done";
+        }
+    }.handle);
+
+    var client: TestClient = undefined;
+    try client.init(std.testing.allocator, io, fx.server.address.ip);
+    defer client.deinit();
+    const warm = try client.request("GET", "/hello", null);
+    try client.run();
+    try std.testing.expectEqual(@as(u16, 200), client.get(warm).status);
+    const id = try client.requestProtocol("CONNECT", "/brief", "websocket", "x");
+    client.get(id).keep_open = true;
+    // Returns once the stream closes: the response ends it from the
+    // server's side, and an RST_STREAM(NO_ERROR) from the client's.
+    try client.run();
+    try std.testing.expectEqualStrings("done", client.get(id).body.items);
+    try std.testing.expectEqual(@as(u32, c.NGHTTP2_NO_ERROR), client.get(id).error_code);
 }
