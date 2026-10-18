@@ -1,6 +1,7 @@
 const std = @import("std");
 const Request = @import("request.zig").Request;
 const Response = @import("response.zig").Response;
+const http = @import("http.zig");
 const Action = @import("router.zig").Action;
 const Connection = @import("server.zig").Connection;
 
@@ -99,7 +100,12 @@ pub fn Executor(comptime Ctx: type) type {
                         log.err("unhandled error after response headers were sent: {} ({f} {s})", .{ err, self.req.method, self.req.url });
                         return err;
                     }
-                    log.err("unhandled error in request handler: {} ({f} {s})", .{ err, self.req.method, self.req.url });
+                    if (clientError(err) != null) {
+                        // The request's fault, answered with a 4xx below.
+                        log.debug("request rejected: {} ({f} {s})", .{ err, self.req.method, self.req.url });
+                    } else {
+                        log.err("unhandled error in request handler: {} ({f} {s})", .{ err, self.req.method, self.req.url });
+                    }
                     self.handleError(err);
                 },
             };
@@ -152,6 +158,10 @@ pub fn Executor(comptime Ctx: type) type {
             self.res.resetBody();
             if (comptime Ctx != void and @hasDecl(Ctx, "uncaughtError")) {
                 self.ctx.uncaughtError(self.req, self.res, err);
+            } else if (clientError(err)) |answer| {
+                self.res.status = answer.status;
+                self.res.content_type = .text;
+                self.res.body = answer.body;
             } else {
                 self.res.status = .internal_server_error;
                 self.res.content_type = .text;
@@ -159,6 +169,34 @@ pub fn Executor(comptime Ctx: type) type {
             }
         }
     };
+}
+
+/// The 4xx for an error that is the request's doing rather than the
+/// handler's: a body over `max_body_size`, a content coding that cannot be
+/// undone, a JSON body that does not parse or fit. Null for anything else.
+pub fn clientError(err: anyerror) ?struct { status: http.Status, body: []const u8 } {
+    return switch (err) {
+        error.BodyTooBig => .{ .status = .payload_too_large, .body = "413 Content Too Large\n" },
+        error.UnsupportedContentEncoding => .{ .status = .unsupported_media_type, .body = "415 Unsupported Media Type\n" },
+        error.SyntaxError,
+        error.UnexpectedEndOfInput,
+        error.UnexpectedToken,
+        error.InvalidNumber,
+        error.InvalidEnumTag,
+        error.DuplicateField,
+        error.UnknownField,
+        error.MissingField,
+        error.LengthMismatch,
+        => .{ .status = .bad_request, .body = "400 Bad Request\n" },
+        else => null,
+    };
+}
+
+test "clientError: request faults map to 4xx, anything else to none" {
+    try std.testing.expectEqual(http.Status.payload_too_large, clientError(error.BodyTooBig).?.status);
+    try std.testing.expectEqual(http.Status.unsupported_media_type, clientError(error.UnsupportedContentEncoding).?.status);
+    try std.testing.expectEqual(http.Status.bad_request, clientError(error.SyntaxError).?.status);
+    try std.testing.expect(clientError(error.OutOfMemory) == null);
 }
 
 // Tests

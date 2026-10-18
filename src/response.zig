@@ -602,6 +602,13 @@ pub const Response = struct {
     sink: ?Sink = null,
     /// The connection's `Io`, for files.
     io: std.Io = undefined,
+    /// Send a `Date` header (RFC 9110 6.6.1) unless the handler set one.
+    /// Set by the server from `ServerConfig.response.date`.
+    send_date: bool = false,
+    /// The Content-Type a buffered body goes out with when the handler set
+    /// neither `content_type` nor the header. Set by the server from
+    /// `ServerConfig.response.default_content_type`.
+    default_content_type: ?http.ContentType = null,
     /// Trailer fields, sent after the body. Only a `sink` carries them
     /// (HTTP/2 does, for gRPC status among others); over HTTP/1.x they are
     /// dropped.
@@ -1307,10 +1314,21 @@ pub const Response = struct {
     /// The header block on the wire. Reports the sentinel, as anything
     /// writing to a `std.Io.Writer` does; the public entry point resolves it.
     fn sendHeader(self: *Response, w: *std.Io.Writer) std.Io.Writer.Error!void {
-        if (self.sink) |sink| return sink.head(self.status, &self.headers, self.headLength());
+        if (self.sink) |sink| {
+            if (self.send_date and self.headers.get("Date") == null) {
+                // The cached date is per thread and short-lived; the sink may
+                // send the head from another task.
+                const date = self.arena.dupe(u8, http.currentHttpDate(self.io)) catch return error.WriteFailed;
+                self.headers.put("Date", date) catch {};
+            }
+            return sink.head(self.status, &self.headers, self.headLength());
+        }
 
         // Write status line
-        try w.print("HTTP/1.1 {d} {f}\r\n", .{ @intFromEnum(self.status), self.status });
+        try w.print("HTTP/1.1 {d} {s}\r\n", .{ @intFromEnum(self.status), self.status.phrase() });
+        if (self.send_date and self.headers.get("Date") == null) {
+            try w.print("Date: {s}\r\n", .{http.currentHttpDate(self.io)});
+        }
 
         // Write headers
         var iter = self.headers.iterator();
@@ -1385,6 +1403,11 @@ pub const Response = struct {
         const send_header = !self.headers_written;
         if (send_header) {
             try self.applyContentType();
+            if (self.default_content_type) |default| {
+                if (self.file == null and self.bodyLen() > 0 and self.headers.get("Content-Type") == null) {
+                    try self.header("Content-Type", default.toContentType());
+                }
+            }
             const compression = self.negotiateCompression();
             if (compression != .off) self.addVary();
             if (compression == .gzip) {

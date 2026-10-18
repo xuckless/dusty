@@ -512,6 +512,7 @@ pub fn Engine(comptime Ctx: type) type {
 
             var sink_state: StreamSink = .{ .stream = stream };
             var response = try Response.initSink(arena, io, sink_state.sink(), server.config.request.max_header_count);
+            server.configureResponse(&response);
             defer response.deinit();
             response.request = &request;
             request.response = &response;
@@ -539,6 +540,16 @@ pub fn Engine(comptime Ctx: type) type {
                 return response.write();
             }
             request.applyEntityHeaders();
+            // A body declared longer than allowed is refused unread; the
+            // engine drops or resets the rest of the stream.
+            if (server.config.request.max_content_length) |max| {
+                if (request.content_length) |len| if (len > max) {
+                    response.status = .payload_too_large;
+                    response.content_type = .text;
+                    response.body = "413 Content Too Large\n";
+                    return response.write();
+                };
+            }
             request.remote_address = server.clientAddress(conn.connection.stream.socket.address, &request.headers);
 
             if (request.headers.get("Expect")) |expect| {

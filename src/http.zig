@@ -190,10 +190,131 @@ pub const Status = enum(c.llhttp_status_t) {
         return std.mem.span(c.llhttp_status_name(@intFromEnum(self)));
     }
 
+    /// The reason phrase for the status line: RFC 9110's for a standard
+    /// code (`Not Found`), else llhttp's name for it.
+    pub fn phrase(self: Status) []const u8 {
+        return switch (@intFromEnum(self)) {
+            100 => "Continue",
+            101 => "Switching Protocols",
+            102 => "Processing",
+            103 => "Early Hints",
+            200 => "OK",
+            201 => "Created",
+            202 => "Accepted",
+            203 => "Non-Authoritative Information",
+            204 => "No Content",
+            205 => "Reset Content",
+            206 => "Partial Content",
+            207 => "Multi-Status",
+            208 => "Already Reported",
+            226 => "IM Used",
+            300 => "Multiple Choices",
+            301 => "Moved Permanently",
+            302 => "Found",
+            303 => "See Other",
+            304 => "Not Modified",
+            305 => "Use Proxy",
+            307 => "Temporary Redirect",
+            308 => "Permanent Redirect",
+            400 => "Bad Request",
+            401 => "Unauthorized",
+            402 => "Payment Required",
+            403 => "Forbidden",
+            404 => "Not Found",
+            405 => "Method Not Allowed",
+            406 => "Not Acceptable",
+            407 => "Proxy Authentication Required",
+            408 => "Request Timeout",
+            409 => "Conflict",
+            410 => "Gone",
+            411 => "Length Required",
+            412 => "Precondition Failed",
+            413 => "Content Too Large",
+            414 => "URI Too Long",
+            415 => "Unsupported Media Type",
+            416 => "Range Not Satisfiable",
+            417 => "Expectation Failed",
+            418 => "I'm a teapot",
+            421 => "Misdirected Request",
+            422 => "Unprocessable Content",
+            423 => "Locked",
+            424 => "Failed Dependency",
+            425 => "Too Early",
+            426 => "Upgrade Required",
+            428 => "Precondition Required",
+            429 => "Too Many Requests",
+            431 => "Request Header Fields Too Large",
+            451 => "Unavailable For Legal Reasons",
+            500 => "Internal Server Error",
+            501 => "Not Implemented",
+            502 => "Bad Gateway",
+            503 => "Service Unavailable",
+            504 => "Gateway Timeout",
+            505 => "HTTP Version Not Supported",
+            506 => "Variant Also Negotiates",
+            507 => "Insufficient Storage",
+            508 => "Loop Detected",
+            510 => "Not Extended",
+            511 => "Network Authentication Required",
+            else => self.name(),
+        };
+    }
+
+    /// Writes the reason phrase (see `phrase`).
     pub fn format(self: Status, writer: anytype) !void {
-        try writer.writeAll(self.name());
+        try writer.writeAll(self.phrase());
     }
 };
+
+test "Status: reason phrases are RFC 9110's" {
+    try std.testing.expectEqualStrings("OK", Status.ok.phrase());
+    try std.testing.expectEqualStrings("Not Found", Status.not_found.phrase());
+    try std.testing.expectEqualStrings("Content Too Large", Status.payload_too_large.phrase());
+    try std.testing.expectEqualStrings("Internal Server Error", Status.internal_server_error.phrase());
+}
+
+/// An IMF-fixdate (RFC 9110 5.6.7), `Sun, 06 Nov 1994 08:49:37 GMT`, of
+/// `seconds` since the epoch. A time before 1970 is given as 1970.
+pub fn formatHttpDate(buf: *[29]u8, seconds: i64) []const u8 {
+    const day_names = [_][]const u8{ "Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed" };
+    const month_names = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+    const epoch_seconds: std.time.epoch.EpochSeconds = .{ .secs = @intCast(@max(seconds, 0)) };
+    const day = epoch_seconds.getEpochDay();
+    const year_day = day.calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    const day_seconds = epoch_seconds.getDaySeconds();
+    return std.fmt.bufPrint(buf, "{s}, {d:0>2} {s} {d:0>4} {d:0>2}:{d:0>2}:{d:0>2} GMT", .{
+        day_names[day.day % 7],
+        month_day.day_index + 1,
+        month_names[month_day.month.numeric() - 1],
+        year_day.year,
+        day_seconds.getHoursIntoDay(),
+        day_seconds.getMinutesIntoHour(),
+        day_seconds.getSecondsIntoMinute(),
+    }) catch unreachable; // years 1970-9999 fit
+}
+
+threadlocal var date_cache: [29]u8 = undefined;
+threadlocal var date_cache_len: usize = 0;
+threadlocal var date_cache_seconds: i64 = -1;
+
+/// The current time for a `Date` header (RFC 9110 6.6.1), formatted at most
+/// once a second per thread. The slice is valid until the next call on this
+/// thread; copy it to keep it.
+pub fn currentHttpDate(io: std.Io) []const u8 {
+    const now = std.Io.Clock.real.now(io).toSeconds();
+    if (now != date_cache_seconds) {
+        date_cache_len = formatHttpDate(&date_cache, now).len;
+        date_cache_seconds = now;
+    }
+    return date_cache[0..date_cache_len];
+}
+
+test "formatHttpDate: IMF-fixdate" {
+    var buf: [29]u8 = undefined;
+    try std.testing.expectEqualStrings("Sun, 06 Nov 1994 08:49:37 GMT", formatHttpDate(&buf, 784111777));
+    try std.testing.expectEqualStrings("Thu, 01 Jan 1970 00:00:00 GMT", formatHttpDate(&buf, -5));
+}
 
 test "Status: construct from llhttp_status_t" {
     const status: Status = @enumFromInt(c.HTTP_STATUS_OK);
@@ -227,7 +348,7 @@ test "Status: name" {
 test "Status: format" {
     var buf: [32]u8 = undefined;
     const result = try std.fmt.bufPrint(&buf, "{f}", .{Status.not_found});
-    try std.testing.expectEqualStrings("NOT_FOUND", result);
+    try std.testing.expectEqualStrings("Not Found", result);
 }
 
 /// Case-insensitive multi-value HTTP header map backed by parallel arrays in a

@@ -2933,3 +2933,92 @@ test "Server.dispatch: a request over a sink is routed through the middleware to
     try std.testing.expect(cap.ended);
     try std.testing.expectEqualStrings("yes", cap.trailer);
 }
+
+/// One HTTP/1.1 request over loopback; returns the raw response head.
+fn rawHead(io: std.Io, server: *dusty.Server(void), request: []const u8, out: []u8) ![]const u8 {
+    const stream = try server.address.ip.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    var wbuf: [256]u8 = undefined;
+    var w = stream.writer(io, &wbuf);
+    try w.interface.writeAll(request);
+    try w.interface.flush();
+    var rbuf: [1024]u8 = undefined;
+    var r = stream.reader(io, &rbuf);
+    var fw: std.Io.Writer = .fixed(out);
+    _ = r.interface.streamRemaining(&fw) catch |err| switch (err) {
+        error.WriteFailed => {},
+        else => |e| return e,
+    };
+    const all = fw.buffered();
+    return all[0 .. std.mem.indexOf(u8, all, "\r\n\r\n") orelse all.len];
+}
+
+test "Server: responses carry a Date header, RFC reason phrases and a default Content-Type" {
+    const io = std.testing.io;
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
+    defer server.deinit();
+    server.router.get("/plain", struct {
+        fn handle(_: *dusty.Request, res: *dusty.Response) !void {
+            res.body = "no type set";
+        }
+    }.handle);
+    server.router.get("/typed", struct {
+        fn handle(_: *dusty.Request, res: *dusty.Response) !void {
+            try res.header("Content-Type", "application/octet-stream");
+            res.body = "typed";
+        }
+    }.handle);
+    var future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer future.cancel(io) catch {};
+    try server.ready.wait(io);
+
+    var buf: [1024]u8 = undefined;
+    const plain = try rawHead(io, &server, "GET /plain HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", &buf);
+    try std.testing.expect(std.mem.startsWith(u8, plain, "HTTP/1.1 200 OK\r\n"));
+    try std.testing.expect(std.mem.indexOf(u8, plain, "\r\nDate: ") != null);
+    try std.testing.expect(std.mem.endsWith(u8, std.mem.sliceTo(plain[std.mem.indexOf(u8, plain, "\r\nDate: ").? + 8 ..], '\r'), " GMT"));
+    try std.testing.expect(std.mem.indexOf(u8, plain, "Content-Type: text/plain; charset=UTF-8") != null);
+
+    var buf2: [1024]u8 = undefined;
+    const typed = try rawHead(io, &server, "GET /typed HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", &buf2);
+    try std.testing.expect(std.mem.indexOf(u8, typed, "Content-Type: application/octet-stream") != null);
+    try std.testing.expect(std.mem.indexOf(u8, typed, "text/plain") == null);
+
+    var buf3: [1024]u8 = undefined;
+    const missing = try rawHead(io, &server, "GET /nope HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", &buf3);
+    try std.testing.expect(std.mem.startsWith(u8, missing, "HTTP/1.1 404 Not Found\r\n"));
+}
+
+test "Server: a body over max_body_size is 413, a declared one over max_content_length is 413 unread" {
+    const io = std.testing.io;
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .listeners = loopback,
+        .request = .{ .max_body_size = 16, .max_content_length = 1000 },
+    }, {});
+    defer server.deinit();
+    server.router.post("/buffer", struct {
+        fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+            _ = try req.body();
+            res.body = "read";
+        }
+    }.handle);
+    var future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer future.cancel(io) catch {};
+    try server.ready.wait(io);
+
+    var buf: [1024]u8 = undefined;
+    const too_big = try rawHead(io, &server, "POST /buffer HTTP/1.1\r\nHost: x\r\nContent-Length: 20\r\nConnection: close\r\n\r\n01234567890123456789", &buf);
+    try std.testing.expect(std.mem.startsWith(u8, too_big, "HTTP/1.1 413 Content Too Large\r\n"));
+
+    var buf2: [1024]u8 = undefined;
+    const declared = try rawHead(io, &server, "POST /buffer HTTP/1.1\r\nHost: x\r\nContent-Length: 5000\r\nExpect: 100-continue\r\n\r\n", &buf2);
+    try std.testing.expect(std.mem.startsWith(u8, declared, "HTTP/1.1 413 Content Too Large\r\n"));
+}
