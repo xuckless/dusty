@@ -17,6 +17,8 @@ pub const Sink = @import("sink.zig").Sink;
 pub const BodySource = @import("request.zig").BodySource;
 pub const BodyWriter = @import("response.zig").BodyWriter;
 pub const StreamingBodyWriter = @import("response.zig").StreamingBodyWriter;
+/// What `Request.reader` returns.
+pub const RequestBodyReader = @import("parser.zig").RequestBodyReader;
 pub const EventStream = @import("response.zig").EventStream;
 pub const EventWriter = @import("response.zig").EventWriter;
 pub const WebSocket = @import("websocket.zig").WebSocket;
