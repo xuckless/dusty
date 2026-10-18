@@ -17,6 +17,9 @@ All notable changes to this project will be documented in this file.
   generated at startup never touches disk. `cert_path` and `key_path` now
   default to empty, and `listen()` fails with `error.MissingTlsCertificate`
   when neither form is given.
+- A failed TLS handshake is now logged at info instead of err (only
+  `OutOfMemory` stays at err). Any peer that reaches the port can fail one at
+  will, so err-level logging let anyone flood the error log.
 - `Listener.kernel_backlog` now defaults to the system's limit, `net.core.somaxconn`
   on Linux, instead of 1024. A full accept queue makes Linux drop new connections,
   which then wait a second or more to retry.
