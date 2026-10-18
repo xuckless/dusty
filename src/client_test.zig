@@ -979,6 +979,93 @@ test "Client: presents a client certificate for mutual TLS" {
     try client_future.await(io);
 }
 
+test "Client: CA and client certificate as PEM in memory, against a listener checking clients with a PEM CA" {
+    if (!build_options.use_tls) return error.SkipZigTest;
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+
+    // Read here only to have PEM text; nothing below sees a path.
+    const cert_pem = try std.Io.Dir.cwd().readFileAlloc(io, test_cert_path, gpa, .limited(64 * 1024));
+    defer gpa.free(cert_pem);
+    const key_pem = try std.Io.Dir.cwd().readFileAlloc(io, test_key_path, gpa, .limited(64 * 1024));
+    defer gpa.free(key_pem);
+
+    var server = dusty.Server(void).init(gpa, io, .{
+        .listeners = &.{.{ .address = loopback_addr, .tls = .{
+            .pem = .{ .cert = cert_pem, .key = key_pem },
+            .client_auth = .{ .ca = .{ .pem = cert_pem } },
+        } }},
+    }, {});
+    defer server.deinit();
+
+    server.router.get("/", struct {
+        fn handle(_: *dusty.Request, res: *dusty.Response) !void {
+            res.body = "authed from memory";
+        }
+    }.handle);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    var client_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void), _io: std.Io, cert: []const u8, key: []const u8) !void {
+            try s.ready.wait(_io);
+            var url_buf: [64]u8 = undefined;
+            const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/", .{s.address.ip.getPort()});
+
+            var client = dusty.Client.init(std.testing.allocator, _io, .{
+                .tls = .{
+                    .ca = .{ .pem = cert },
+                    .client_certificate = .{ .pem = .{ .cert = cert, .key = key } },
+                },
+            });
+            defer client.deinit();
+
+            var response = try client.fetch(url, .{});
+            defer response.deinit();
+
+            try std.testing.expectEqual(.ok, response.status());
+            try std.testing.expectEqualStrings("authed from memory", (try response.body()).?);
+        }
+    }.run, .{ &server, io, cert_pem, key_pem });
+
+    try client_future.await(io);
+}
+
+test "TlsCa: .pem loads what .file loads" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    const cert_pem = try std.Io.Dir.cwd().readFileAlloc(io, test_cert_path, gpa, .limited(64 * 1024));
+    defer gpa.free(cert_pem);
+
+    const from_file: dusty.TlsCa = .{ .file = .{ .path = test_cert_path } };
+    var a = try from_file.load(gpa, io);
+    defer a.deinit(gpa);
+    // Twice over, with CRLF line ends: the same certificate, kept once.
+    const doubled = try std.mem.concat(gpa, u8, &.{ cert_pem, cert_pem });
+    defer gpa.free(doubled);
+    const crlf = try std.mem.replaceOwned(u8, gpa, doubled, "\n", "\r\n");
+    defer gpa.free(crlf);
+    const from_pem: dusty.TlsCa = .{ .pem = crlf };
+    var b = try from_pem.load(gpa, io);
+    defer b.deinit(gpa);
+
+    try std.testing.expect(a.bytes.items.len > 0);
+    try std.testing.expectEqualSlices(u8, a.bytes.items, b.bytes.items);
+    try std.testing.expectEqual(a.map.count(), b.map.count());
+
+    const cut: dusty.TlsCa = .{ .pem = cert_pem[0 .. cert_pem.len - 30] };
+    try std.testing.expectError(error.MissingEndCertificateMarker, cut.load(gpa, io));
+    const empty: dusty.TlsCa = .{ .pem = "" };
+    var none = try empty.load(gpa, io);
+    defer none.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 0), none.bytes.items.len);
+}
+
 test "Server: client_auth .require rejects a client with no certificate" {
     if (!build_options.use_tls) return error.SkipZigTest;
     const io = std.testing.io;

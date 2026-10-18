@@ -143,14 +143,22 @@ pub const TlsConfig = struct {
 
     pub const ClientCertificate = struct {
         /// PEM certificate chain, leaf first, resolved against `dir`.
-        cert_path: []const u8,
+        /// Ignored when `pem` is set.
+        cert_path: []const u8 = "",
         /// PEM private key for the leaf certificate, resolved against `dir`.
         /// Must be PKCS#8 ("BEGIN PRIVATE KEY") or SEC1 ("BEGIN EC PRIVATE
-        /// KEY"); passphrase-protected keys are not supported.
-        key_path: []const u8,
+        /// KEY"); passphrase-protected keys are not supported. Ignored when
+        /// `pem` is set.
+        key_path: []const u8 = "",
+        /// The chain and key as PEM text in memory, in place of the paths,
+        /// as `ServerConfig.Tls.pem` is for a listener. Read on the first
+        /// HTTPS request; it must stay alive until then.
+        pem: ?Pem = null,
         /// Directory the paths are resolved against. Defaults to the current
         /// working directory.
         dir: ?std.Io.Dir = null,
+
+        pub const Pem = config_mod.ServerConfig.Tls.Pem;
     };
 
     pub const Path = config_mod.TlsPath;
@@ -1019,13 +1027,16 @@ pub const Client = struct {
         var client_cert: ?tls.config.CertKeyPair = null;
         errdefer if (client_cert) |*pair| pair.deinit(self.allocator);
         if (cfg.client_certificate) |cc| {
-            client_cert = try tls.config.CertKeyPair.fromFilePath(
-                self.allocator,
-                self.io,
-                cc.dir orelse std.Io.Dir.cwd(),
-                cc.cert_path,
-                cc.key_path,
-            );
+            client_cert = if (cc.pem) |pem|
+                try tls.config.CertKeyPair.fromSlice(self.allocator, self.io, pem.cert, pem.key)
+            else
+                try tls.config.CertKeyPair.fromFilePath(
+                    self.allocator,
+                    self.io,
+                    cc.dir orelse std.Io.Dir.cwd(),
+                    cc.cert_path,
+                    cc.key_path,
+                );
         }
 
         self.tls_state = .{ .ca_bundle = ca_bundle, .trust = trust, .client_cert = client_cert };
