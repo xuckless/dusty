@@ -1214,6 +1214,9 @@ pub const Response = struct {
         if (self.headers.get("Content-Encoding") != null) return .off;
         if (self.headers.get("Content-Length") != null) return .off;
         if (self.headers.get("Content-Range") != null) return .off;
+        // Already compressed media gains nothing and costs CPU.
+        const content_type = self.headers.get("Content-Type") orelse if (self.content_type) |ct| ct.toContentType() else null;
+        if (!http.isCompressible(content_type)) return .off;
 
         // Content-Encoding, except on a 304, and Vary if it is not there
         // yet. Without the room the body goes out as it is, which no cache

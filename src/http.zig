@@ -890,6 +890,46 @@ pub const ContentEncoding = enum {
     }
 };
 
+/// Whether a body of this media type (a Content-Type value, parameters
+/// allowed) is worth compressing: text, and the structured and script
+/// formats that are text underneath. Images other than SVG, audio, video,
+/// fonts other than TTF/OTF, and archives are already compressed. No type at
+/// all counts as compressible (it goes out as text/plain by default).
+pub fn isCompressible(content_type: ?[]const u8) bool {
+    const full = content_type orelse return true;
+    const essence = std.mem.trim(u8, full[0 .. std.mem.indexOfScalar(u8, full, ';') orelse full.len], " \t");
+    const slash = std.mem.indexOfScalar(u8, essence, '/') orelse return false;
+    const top = essence[0..slash];
+    const sub = essence[slash + 1 ..];
+    if (std.ascii.eqlIgnoreCase(top, "text")) return true;
+    // Structured syntax suffixes (RFC 6839): +json, +xml, +yaml.
+    inline for (.{ "+json", "+xml", "+yaml" }) |suffix| {
+        if (std.ascii.endsWithIgnoreCase(sub, suffix)) return true;
+    }
+    if (std.ascii.eqlIgnoreCase(top, "application")) {
+        inline for (.{ "json", "javascript", "ecmascript", "xml", "wasm", "yaml", "x-yaml", "x-ndjson", "x-www-form-urlencoded", "graphql", "x-javascript", "x-sh", "toml", "sql", "csv", "rtf" }) |name| {
+            if (std.ascii.eqlIgnoreCase(sub, name)) return true;
+        }
+        return false;
+    }
+    if (std.ascii.eqlIgnoreCase(top, "image")) return std.ascii.eqlIgnoreCase(sub, "svg+xml") or std.ascii.eqlIgnoreCase(sub, "x-icon") or std.ascii.eqlIgnoreCase(sub, "bmp");
+    if (std.ascii.eqlIgnoreCase(top, "font")) return std.ascii.eqlIgnoreCase(sub, "ttf") or std.ascii.eqlIgnoreCase(sub, "otf");
+    return false;
+}
+
+test "isCompressible: text and structured types yes, compressed media no" {
+    try std.testing.expect(isCompressible("text/html; charset=utf-8"));
+    try std.testing.expect(isCompressible("application/json"));
+    try std.testing.expect(isCompressible("application/vnd.api+json"));
+    try std.testing.expect(isCompressible("image/svg+xml"));
+    try std.testing.expect(isCompressible(null));
+    try std.testing.expect(!isCompressible("image/png"));
+    try std.testing.expect(!isCompressible("video/mp4"));
+    try std.testing.expect(!isCompressible("application/zip"));
+    try std.testing.expect(!isCompressible("application/octet-stream"));
+    try std.testing.expect(!isCompressible("font/woff2"));
+}
+
 /// Whether the request's `Accept-Encoding` (RFC 9110 §12.5.3) lets a
 /// response be sent gzipped: gzip, or failing that `*`, listed without
 /// `q=0`. A field sent on several lines is one list.

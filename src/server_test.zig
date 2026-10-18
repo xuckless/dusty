@@ -3174,3 +3174,49 @@ test "Server: a zstd request body is refused with 415 when built without zstd" {
     const head = try rawHead(io, &server, "POST /body HTTP/1.1\r\nHost: x\r\nContent-Encoding: zstd\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabc", &buf);
     try std.testing.expect(std.mem.startsWith(u8, head, "HTTP/1.1 415 Unsupported Media Type\r\n"));
 }
+
+test "Server: the Compress middleware gzips text and leaves images alone" {
+    if (!@import("build_options").use_zlib) return error.SkipZigTest;
+    const io = std.testing.io;
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
+    defer server.deinit();
+    var compress = dusty.middleware.Compress.init();
+    const mws = [_]dusty.Middleware(void){dusty.Middleware(void).init(&compress)};
+    server.router.middlewares = &mws;
+    server.router.get("/text", struct {
+        fn handle(_: *dusty.Request, res: *dusty.Response) !void {
+            res.content_type = .text;
+            res.body = comptime repeat("compressible ", 40);
+        }
+    }.handle);
+    server.router.get("/image", struct {
+        fn handle(_: *dusty.Request, res: *dusty.Response) !void {
+            res.content_type = .png;
+            res.body = comptime repeat("pretend png bytes ", 40);
+        }
+    }.handle);
+    var future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer future.cancel(io) catch {};
+    try server.ready.wait(io);
+
+    var buf: [4096]u8 = undefined;
+    const text = try rawHead(io, &server, "GET /text HTTP/1.1\r\nHost: x\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n", &buf);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Content-Encoding: gzip") != null);
+    var buf2: [4096]u8 = undefined;
+    const image = try rawHead(io, &server, "GET /image HTTP/1.1\r\nHost: x\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n", &buf2);
+    try std.testing.expect(std.mem.indexOf(u8, image, "Content-Encoding") == null);
+}
+
+/// `s` `n` times, at compile time.
+fn repeat(comptime s: []const u8, comptime n: usize) []const u8 {
+    comptime {
+        var out: [s.len * n]u8 = undefined;
+        for (0..n) |i| @memcpy(out[i * s.len ..][0..s.len], s);
+        const final = out;
+        return &final;
+    }
+}
