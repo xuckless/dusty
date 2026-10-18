@@ -28,6 +28,9 @@ const TestClient = struct {
     plain_write: [4096]u8 = undefined,
     session: ?*c.nghttp2_session = null,
     responses: std.AutoHashMapUnmanaged(i32, *Resp) = .empty,
+    /// The last-stream-ID of each GOAWAY received, in order.
+    goaways: [4]i32 = undefined,
+    goaway_count: usize = 0,
 
     const Resp = struct {
         status: u16 = 0,
@@ -79,6 +82,7 @@ const TestClient = struct {
         c.nghttp2_session_callbacks_set_on_header_callback(callbacks, onHeader);
         c.nghttp2_session_callbacks_set_on_data_chunk_recv_callback(callbacks, onData);
         c.nghttp2_session_callbacks_set_on_stream_close_callback(callbacks, onClose);
+        c.nghttp2_session_callbacks_set_on_frame_recv_callback(callbacks, onFrame);
         if (c.nghttp2_session_client_new(&self.session, callbacks, self) != 0) return error.Http2Init;
         if (c.nghttp2_submit_settings(self.session, c.NGHTTP2_FLAG_NONE, null, 0) != 0) return error.Http2Init;
     }
@@ -174,6 +178,37 @@ const TestClient = struct {
         return 0;
     }
 
+    fn onFrame(_: ?*c.nghttp2_session, frame: [*c]const c.nghttp2_frame, user_data: ?*anyopaque) callconv(.c) c_int {
+        const self: *TestClient = @ptrCast(@alignCast(user_data.?));
+        if (frame.*.hd.type == c.NGHTTP2_GOAWAY and self.goaway_count < self.goaways.len) {
+            self.goaways[self.goaway_count] = frame.*.goaway.last_stream_id;
+            self.goaway_count += 1;
+        }
+        return 0;
+    }
+
+    /// Keeps the connection going (answering PINGs and SETTINGS) until the
+    /// server closes it.
+    fn runUntilClosed(self: *TestClient) !void {
+        while (true) {
+            while (true) {
+                var data: [*c]const u8 = undefined;
+                const n = c.nghttp2_session_mem_send2(self.session, &data);
+                if (n < 0) return error.Http2Send;
+                if (n == 0) break;
+                try self.w.writeAll(data[0..@intCast(n)]);
+            }
+            try self.w.flush();
+            const bytes = self.r.peekGreedy(1) catch |err| switch (err) {
+                error.EndOfStream => return,
+                else => |e| return e,
+            };
+            const rv = c.nghttp2_session_mem_recv2(self.session, bytes.ptr, bytes.len);
+            if (rv < 0) return error.Http2Recv;
+            self.r.toss(@intCast(rv));
+        }
+    }
+
     fn onClose(session: ?*c.nghttp2_session, id: i32, error_code: u32, _: ?*anyopaque) callconv(.c) c_int {
         const resp = respFor(session, id) orelse return 0;
         resp.closed = true;
@@ -218,6 +253,10 @@ const Handlers = struct {
     fn ignoreBody(_: *dusty.Request, res: *dusty.Response) !void {
         res.body = "not reading that";
     }
+    fn slow(req: *dusty.Request, res: *dusty.Response) !void {
+        try req.io.sleep(.fromMilliseconds(300), .awake);
+        res.body = "slow but whole";
+    }
 };
 
 const Fixture = struct {
@@ -233,6 +272,7 @@ const Fixture = struct {
         self.server.router.post("/echo", Handlers.echo);
         self.server.router.get("/trailers", Handlers.trailers);
         self.server.router.post("/ignore", Handlers.ignoreBody);
+        self.server.router.get("/slow", Handlers.slow);
         self.future = try io.concurrent(run, .{&self.server});
         try self.server.ready.wait(io);
     }
@@ -475,4 +515,71 @@ test "HTTP/2: a warm connection serves requests without allocating" {
         try std.testing.expectEqualStrings("user 2", client.get(id).body.items);
     }
     try std.testing.expectEqual(before, counting.count.load(.monotonic));
+}
+
+fn stopFixture(f: *Fixture, io: std.Io) void {
+    f.future.cancel(io) catch {};
+}
+
+test "HTTP/2: a drain closes an idle connection with GOAWAY at once" {
+    const io = std.testing.io;
+    var fx: Fixture = undefined;
+    try fx.start(io);
+    defer fx.server.deinit();
+
+    var client: TestClient = undefined;
+    try client.init(std.testing.allocator, io, fx.server.address.ip);
+    defer client.deinit();
+    const id = try client.request("GET", "/hello", null);
+    try client.run();
+    try std.testing.expectEqual(@as(u16, 200), client.get(id).status);
+
+    const started: std.Io.Clock.Timestamp = .now(io, .awake);
+    var stopper = try io.concurrent(stopFixture, .{ &fx, io });
+    defer stopper.await(io);
+
+    // An nghttp2 client with nothing open takes the GOAWAY notice as the
+    // end and closes; the server's side ends with it, well before the
+    // notice's one-second fallback.
+    try client.runUntilClosed();
+    try std.testing.expect(client.goaway_count >= 1);
+    try std.testing.expectEqual(@as(i32, std.math.maxInt(i32)), client.goaways[0]);
+    try std.testing.expect(started.durationTo(.now(io, .awake)).raw.toMilliseconds() < 900);
+}
+
+test "HTTP/2: a drain with a stream in flight sends a two-phase GOAWAY and finishes the stream" {
+    const io = std.testing.io;
+    var fx: Fixture = undefined;
+    try fx.start(io);
+    defer fx.server.deinit();
+
+    var client: TestClient = undefined;
+    try client.init(std.testing.allocator, io, fx.server.address.ip);
+    defer client.deinit();
+    const warm = try client.request("GET", "/hello", null);
+    try client.run();
+    try std.testing.expectEqual(@as(u16, 200), client.get(warm).status);
+
+    // Start the slow request, then shut down while it runs.
+    const id = try client.request("GET", "/slow", null);
+    while (true) {
+        var data: [*c]const u8 = undefined;
+        const n = c.nghttp2_session_mem_send2(client.session, &data);
+        if (n <= 0) break;
+        try client.w.writeAll(data[0..@intCast(n)]);
+    }
+    try client.w.flush();
+    try io.sleep(.fromMilliseconds(100), .awake);
+    var stopper = try io.concurrent(stopFixture, .{ &fx, io });
+    defer stopper.await(io);
+
+    try client.runUntilClosed();
+    // The notice (the largest stream ID), answered with the PING ack,
+    // then the final GOAWAY naming the slow stream as the last one taken.
+    try std.testing.expectEqual(@as(usize, 2), client.goaway_count);
+    try std.testing.expectEqual(@as(i32, std.math.maxInt(i32)), client.goaways[0]);
+    try std.testing.expectEqual(id, client.goaways[1]);
+    const resp = client.get(id);
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    try std.testing.expectEqualStrings("slow but whole", resp.body.items);
 }

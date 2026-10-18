@@ -77,9 +77,69 @@ const out_queue_len = 32 * 1024;
 /// The handler-side buffer in front of that queue.
 const body_writer_len = 16 * 1024;
 
+/// The PING sent with a drain's GOAWAY notice.
+const drain_ping: [8]u8 = "dusty-go".*;
+
 pub fn Engine(comptime Ctx: type) type {
     return struct {
         const Server = @import("../server.zig").Server(Ctx);
+
+        /// The server's open HTTP/2 connections, for the drain.
+        pub const Registry = struct {
+            mutex: std.Io.Mutex = .init,
+            list: std.DoublyLinkedList = .{},
+
+            fn server(r: *Registry) *Server {
+                return @alignCast(@fieldParentPtr("h2_conns", r));
+            }
+
+            fn add(r: *Registry, conn: *Conn) void {
+                const io = r.server().io;
+                r.mutex.lockUncancelable(io);
+                r.list.append(&conn.node);
+                r.mutex.unlock(io);
+                // A drain that started before the append missed this one.
+                // The flag was set before the drain took the registry, so
+                // either it sees the connection or this sees the flag.
+                if (r.server().busy.load(.acquire).draining) conn.beginDrain();
+            }
+
+            fn remove(r: *Registry, conn: *Conn) void {
+                const io = r.server().io;
+                r.mutex.lockUncancelable(io);
+                defer r.mutex.unlock(io);
+                r.list.remove(&conn.node);
+            }
+
+            /// Sends every connection the drain's GOAWAY notice. Whether
+            /// there were any.
+            pub fn beginDrain(r: *Registry) bool {
+                const io = r.server().io;
+                r.mutex.lockUncancelable(io);
+                defer r.mutex.unlock(io);
+                var it = r.list.first;
+                while (it) |node| : (it = node.next) {
+                    const conn: *Conn = @fieldParentPtr("node", node);
+                    conn.beginDrain();
+                }
+                return r.list.first != null;
+            }
+
+            /// Sends the final GOAWAY to connections whose peer has not
+            /// answered the notice's PING.
+            pub fn finishDrain(r: *Registry) void {
+                const io = r.server().io;
+                r.mutex.lockUncancelable(io);
+                defer r.mutex.unlock(io);
+                var it = r.list.first;
+                while (it) |node| : (it = node.next) {
+                    const conn: *Conn = @fieldParentPtr("node", node);
+                    conn.lock();
+                    defer conn.unlock();
+                    conn.finishDrainLocked();
+                }
+            }
+        };
 
         /// One HTTP/2 connection: the session, its streams, and what the
         /// reader, writer and stream tasks share.
@@ -110,10 +170,61 @@ pub fn Engine(comptime Ctx: type) type {
             closing: bool = false,
             /// A GOAWAY went out because the server is draining.
             goaway_sent: bool = false,
+            /// The drain's GOAWAY notice went out and the final one is not
+            /// submitted yet.
+            drain_notice: bool = false,
+            /// The connection holds one count in the server's in-flight
+            /// requests from the drain's notice until its final GOAWAY is
+            /// written, so the drain's cancel cannot cut that off.
+            drain_hold: bool = false,
+            /// The final GOAWAY was handed to the writer; the hold goes
+            /// once the writer has flushed it.
+            drain_flush: bool = false,
+            /// In `Registry`.
+            node: std.DoublyLinkedList.Node = .{},
 
             /// Bumped (under the mutex) whenever the session may have output.
             /// The writer waits on it.
             write_gen: std.atomic.Value(u32) = .init(0),
+
+            /// Drain, phase one: GOAWAY with the largest stream ID, which
+            /// streams already on the way still fit under, and a PING whose
+            /// answer says they have arrived. Takes the mutex.
+            fn beginDrain(conn: *Conn) void {
+                conn.lock();
+                defer conn.unlock();
+                if (conn.goaway_sent or conn.drain_notice or conn.closing) return;
+                if (c.nghttp2_submit_shutdown_notice(conn.session) != 0) return;
+                _ = c.nghttp2_submit_ping(conn.session, c.NGHTTP2_FLAG_NONE, &drain_ping);
+                conn.drain_notice = true;
+                conn.drain_hold = true;
+                _ = conn.server.busy.fetchAdd(.{ .count = 1 }, .acq_rel);
+                conn.kickWriter();
+            }
+
+            /// Drain, phase two: GOAWAY with the last stream taken. Once
+            /// the open streams finish the session is done and the writer
+            /// closes the connection. Under the mutex.
+            fn finishDrainLocked(conn: *Conn) void {
+                if (!conn.drain_notice) return;
+                conn.drain_notice = false;
+                if (!conn.goaway_sent and !conn.closing and
+                    c.nghttp2_submit_goaway(conn.session, c.NGHTTP2_FLAG_NONE, c.nghttp2_session_get_last_proc_stream_id(conn.session), c.NGHTTP2_NO_ERROR, null, 0) == 0)
+                {
+                    conn.goaway_sent = true;
+                    conn.kickWriter();
+                    return; // the hold goes when the writer has flushed it
+                }
+                conn.releaseDrainHold();
+            }
+
+            /// Under the mutex.
+            fn releaseDrainHold(conn: *Conn) void {
+                if (!conn.drain_hold) return;
+                conn.drain_hold = false;
+                conn.drain_flush = false;
+                conn.server.finishRequest();
+            }
 
             fn kickWriter(conn: *Conn) void {
                 _ = conn.write_gen.fetchAdd(1, .release);
@@ -303,9 +414,14 @@ pub fn Engine(comptime Ctx: type) type {
                 .config = server.config.http2,
             };
             try conn.initSession();
+            server.h2_conns.add(&conn);
             defer {
+                server.h2_conns.remove(&conn);
                 conn.lock();
                 defer conn.unlock();
+                // A drain still holding the server: give back its count.
+                conn.drain_notice = false;
+                conn.releaseDrainHold();
                 // The tasks are joined (the group's cancel runs first), so
                 // each release here is the freeing one.
                 while (true) {
@@ -462,6 +578,12 @@ pub fn Engine(comptime Ctx: type) type {
                     writer.writeAll(staging.items) catch return conn.connection.getWriteError() orelse error.Unexpected;
                     writer.flush() catch return conn.connection.getWriteError() orelse error.Unexpected;
                     staging.clearRetainingCapacity();
+                    // The drain's final GOAWAY is on the wire now.
+                    if (@atomicLoad(bool, &conn.drain_flush, .acquire)) {
+                        conn.lock();
+                        defer conn.unlock();
+                        if (conn.drain_flush) conn.releaseDrainHold();
+                    }
                     continue;
                 }
                 // The session is over (a GOAWAY went out, for a protocol
@@ -925,8 +1047,10 @@ pub fn Engine(comptime Ctx: type) type {
 
             // A draining server takes no new requests: refuse the stream,
             // which the client can safely retry elsewhere, and say so once
-            // with GOAWAY.
-            if (conn.server.busy.load(.acquire).draining) {
+            // with GOAWAY. Between the drain's notice and its final GOAWAY
+            // streams are still taken: the peer may have sent them before
+            // it saw the notice.
+            if (conn.server.busy.load(.acquire).draining and !conn.drain_notice) {
                 if (!conn.goaway_sent) {
                     conn.goaway_sent = true;
                     _ = c.nghttp2_submit_goaway(session, c.NGHTTP2_FLAG_NONE, c.nghttp2_session_get_last_proc_stream_id(session), c.NGHTTP2_NO_ERROR, null, 0);
@@ -986,6 +1110,13 @@ pub fn Engine(comptime Ctx: type) type {
         fn onFrameRecv(session: ?*c.nghttp2_session, frame: [*c]const c.nghttp2_frame, user_data: ?*anyopaque) callconv(.c) c_int {
             const conn = connFrom(user_data);
             const hd = frame.*.hd;
+            // The answer to the drain notice's PING: everything the peer
+            // sent before it saw the notice is in.
+            if (hd.type == c.NGHTTP2_PING and hd.flags & c.NGHTTP2_FLAG_ACK != 0) {
+                const data: [8]u8 = frame.*.ping.opaque_data;
+                if (std.mem.eql(u8, &data, &drain_ping)) conn.finishDrainLocked();
+                return 0;
+            }
             const stream = streamFor(session, hd.stream_id) orelse return 0;
             const end_stream = hd.flags & c.NGHTTP2_FLAG_END_STREAM != 0;
             switch (hd.type) {
@@ -1028,6 +1159,13 @@ pub fn Engine(comptime Ctx: type) type {
         fn onFrameSend(session: ?*c.nghttp2_session, frame: [*c]const c.nghttp2_frame, user_data: ?*anyopaque) callconv(.c) c_int {
             const conn = connFrom(user_data);
             const hd = frame.*.hd;
+            // The drain's final GOAWAY (not its notice) left the session.
+            if (hd.type == c.NGHTTP2_GOAWAY and conn.drain_hold and !conn.drain_notice and
+                frame.*.goaway.last_stream_id != std.math.maxInt(i32))
+            {
+                @atomicStore(bool, &conn.drain_flush, true, .release);
+                return 0;
+            }
             if (hd.flags & c.NGHTTP2_FLAG_END_STREAM == 0) return 0;
             if (hd.type != c.NGHTTP2_HEADERS and hd.type != c.NGHTTP2_DATA) return 0;
             const stream = streamFor(session, hd.stream_id) orelse return 0;
