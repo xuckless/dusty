@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- `Router.group` copies its middleware list into the router, as `use` and
+  a nested `group` already did, so the list can be a temporary (`&.{mw}`)
+  on a frame that returns before the server runs. It used to keep the
+  caller's slice, and a request to the group's routes then ran whatever
+  that stack memory had become.
 - On a listener that also takes HTTP/2 with prior knowledge, a first
   request line that does not start with a method is taken for an invalid
   HTTP/2 preface (RFC 9113 section 3.4): the connection is closed without
