@@ -8,6 +8,13 @@ All notable changes to this project will be documented in this file.
   `Connection: keep-alive` on its response when the server keeps it. Without
   it an HTTP/1.0 client (ApacheBench with `-k`, for one) waits for the server
   to close, while the server waits for the next request.
+- Added a protocol-neutral seam for engines other than the HTTP/1.x loop
+  (HTTP/2 first): `Response.initSink` writes the head, body and end of a
+  response to a `Sink` instead of formatting HTTP/1.x; `Response.trailer`
+  adds trailer fields, which a sink carries; `Request.body_source` delivers a
+  body that arrives unframed, decoded as usual; `Request.applyEntityHeaders`
+  fills the entity fields from the headers; and `Server.dispatch` routes a
+  request through the middleware to its handler. HTTP/1.x is unchanged.
 - Added the `use_bundled_tls` build option. Applications can keep TLS enabled
   while replacing Dusty's pinned tls.zig dependency with a compatible module.
 - Server and client connections now call `tls.Connection.deinit` on close
