@@ -20,6 +20,9 @@ All notable changes to this project will be documented in this file.
 - A failed TLS handshake is now logged at info instead of err (only
   `OutOfMemory` stays at err). Any peer that reaches the port can fail one at
   will, so err-level logging let anyone flood the error log.
+- Added the `use_bundled_nghttp2` build option. With `use_http2` enabled,
+  applications can inject their own `nghttp2` module instead of compiling the
+  vendored copy, so a binary that already builds nghttp2 links only one.
 - `Listener.kernel_backlog` now defaults to the system's limit, `net.core.somaxconn`
   on Linux, instead of 1024. A full accept queue makes Linux drop new connections,
   which then wait a second or more to retry.
