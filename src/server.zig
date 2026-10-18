@@ -419,6 +419,10 @@ pub fn Server(comptime Ctx: type) type {
         /// first. A connection waiting between requests is not counted; it
         /// has nothing to lose to the cancel that follows the drain.
         busy: std.atomic.Value(Busy),
+        /// The open HTTP/2 connections, so a drain can tell each one with
+        /// GOAWAY that no new streams will be taken.
+        h2_conns: if (build_options.use_http2) h2.Engine(Ctx).Registry else void =
+            if (build_options.use_http2) .{} else {},
         /// The first listener's bound address, once `ready` is set. A
         /// listener given port zero has its real port here.
         address: Address,
@@ -872,12 +876,27 @@ pub fn Server(comptime Ctx: type) type {
         /// detail of how the drain went. Connections that
         /// outlast the wait are logged and left to the caller's deferred
         /// `group.cancel`, which tears them down either way.
+        /// How long the final GOAWAY waits for the peer to answer the
+        /// notice's PING.
+        const h2_notice_wait: std.Io.Duration = .fromSeconds(1);
+
         fn drainConnections(self: *Self) void {
             const protection = self.io.swapCancelProtection(.blocked);
             defer _ = self.io.swapCancelProtection(protection);
 
             log.info("Graceful shutdown requested", .{});
             _ = self.busy.fetchOr(.{ .draining = true }, .acq_rel);
+
+            // HTTP/2 connections get a two-phase GOAWAY (RFC 9113 §6.8): a
+            // notice now, the final one a round trip later, when the PING
+            // sent with the notice comes back, or after `h2_notice_wait` for
+            // a peer that does not answer. Each holds the drain open until
+            // its final GOAWAY is out.
+            var notice_deadline: ?std.Io.Clock.Timestamp = null;
+            if (comptime build_options.use_http2) {
+                if (self.h2_conns.beginDrain())
+                    notice_deadline = std.Io.Clock.Timestamp.now(self.io, .awake).addDuration(.{ .raw = h2_notice_wait, .clock = .awake });
+            }
 
             // Turned into a deadline once, so the budget covers the drain as
             // a whole. A per-wait duration would restart it every time a
@@ -900,11 +919,22 @@ pub fn Server(comptime Ctx: type) type {
                     }
                 }
 
+                var wait = timeout;
+                if (notice_deadline) |nd| {
+                    if (std.Io.Clock.Timestamp.now(self.io, .awake).compare(.gte, nd)) {
+                        if (comptime build_options.use_http2) self.h2_conns.finishDrain();
+                        notice_deadline = null;
+                        continue;
+                    }
+                    const nd_timeout: std.Io.Timeout = .{ .deadline = nd };
+                    wait = if (timeout.toTimestamp(self.io)) |d| (if (d.compare(.lt, nd)) timeout else nd_timeout) else nd_timeout;
+                }
+
                 log.info("Waiting for {} in-flight request(s) to finish", .{remaining});
                 // Wakes when a request finishes, or when the deadline
                 // arrives; the loop above decides which happened. Spurious
                 // wakeups just re-read the count.
-                self.io.futexWaitTimeout(Busy, &self.busy.raw, state, timeout) catch |err| switch (err) {
+                self.io.futexWaitTimeout(Busy, &self.busy.raw, state, wait) catch |err| switch (err) {
                     // Cannot happen: protection is blocked for this whole
                     // function, so no Io call here is a cancelation point.
                     error.Canceled => unreachable,
