@@ -52,6 +52,14 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/zio_stub.zig"),
     });
 
+    // HTTP/2 for the client is injected too: an application with an HTTP/2
+    // client module replaces this stub, and a TLS connection on which ALPN
+    // picks "h2" is then handed to it (see src/h2_client_stub.zig):
+    //   dusty_mod.addImport("h2_client", its_h2_client_module);
+    mod.addAnonymousImport("h2_client", .{
+        .root_source_file = b.path("src/h2_client_stub.zig"),
+    });
+
     // TLS support is a lazy dependency: only fetched when both TLS and the
     // bundled provider are enabled (the defaults). Applications can keep TLS
     // active while injecting a compatible module with:

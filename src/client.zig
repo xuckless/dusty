@@ -7,6 +7,12 @@ const tls = @import("tls");
 const has_trust_store = build_options.use_tls and @hasDecl(tls, "TrustStore");
 const TrustStore = if (has_trust_store) tls.TrustStore else void;
 const build_options = @import("build_options");
+/// An HTTP/2 client, injected as the `h2_client` import like `tls` and
+/// `nghttp2` (src/h2_client_stub.zig lists what it must provide). With one,
+/// `ClientConfig.http2` offers "h2" through ALPN, and a connection on which
+/// the server picks it is handed to it after the handshake.
+const h2_client = @import("h2_client");
+const has_h2_client = build_options.use_tls and !@hasDecl(h2_client, "is_stub");
 
 const unix_path_max = 108;
 
@@ -29,6 +35,7 @@ const WebSocket = @import("websocket.zig").WebSocket;
 const ResponseParser = @import("parser.zig").ResponseParser;
 const ParsedResponse = @import("parser.zig").ParsedResponse;
 const ResponseBodyReader = @import("parser.zig").ResponseBodyReader;
+const BodySource = @import("parser.zig").BodySource;
 const Transport = @import("transport.zig").Transport;
 const Deadline = @import("deadline.zig").Deadline;
 const KeepAliveParams = @import("parser.zig").KeepAliveParams;
@@ -119,9 +126,11 @@ pub const ClientConfig = struct {
     /// User-Agent header sent with requests. Set to null to omit it.
     /// A per-request User-Agent header takes precedence over this default.
     user_agent: ?[]const u8 = default_user_agent,
-    /// Advertise HTTP/2 ("h2") via TLS ALPN on HTTPS connections. Only effective
-    /// when the library is built with the `use_http2` build option; ignored for
-    /// cleartext (http://) connections. Defaults off.
+    /// Offer HTTP/2 ("h2") through TLS ALPN on HTTPS connections. Only
+    /// effective with an injected HTTP/2 client (the `h2_client` import);
+    /// ignored without one, and for cleartext (http://) connections. A
+    /// connection on which the server picks h2 carries one request at a time
+    /// and is pooled like an HTTP/1.1 one. Defaults off.
     http2: bool = false,
 };
 
@@ -512,6 +521,11 @@ pub const Connection = struct {
     keep_alive: KeepAliveParams = .{},
     idle_deadline: ?std.Io.Timestamp = null,
 
+    // When the handshake picked "h2": the session, which reads and writes the
+    // connection from then on, and the stream of the request in flight.
+    h2: if (has_h2_client) ?*h2_client.ClientConnection else void,
+    h2_stream: if (has_h2_client) ?*h2_client.Stream else void,
+
     /// Initialize the connection in place (required because parser stores internal pointers).
     pub fn init(
         self: *Connection,
@@ -565,6 +579,10 @@ pub const Connection = struct {
         // Protocol and TLS initialization
         self.protocol = protocol;
         self.http_version = .http_1_1;
+        if (comptime has_h2_client) {
+            self.h2 = null;
+            self.h2_stream = null;
+        }
 
         if (protocol == .https) {
             if (!build_options.use_tls) return error.TlsNotConfigured;
@@ -633,6 +651,13 @@ pub const Connection = struct {
             self.tls_writer = self.tls_conn.?.writer(self.write_buffer);
             self.reader = &self.tls_reader.interface;
             self.writer = &self.tls_writer.interface;
+
+            if (comptime has_h2_client) if (self.http_version == .http_2) {
+                self.h2 = h2_client.ClientConnection.adopt(allocator, io, self.reader, self.writer, stream) catch |err| {
+                    if (@hasDecl(tls.Connection, "deinit")) self.tls_conn.?.deinit();
+                    return err;
+                };
+            };
         } else {
             self.tls_conn = null;
             self.tls_tcp_read_buffer = &.{};
@@ -682,6 +707,14 @@ pub const Connection = struct {
     }
 
     pub fn deinit(self: *Connection) void {
+        // The session's tasks use the TLS connection and the socket, so it
+        // goes first.
+        if (comptime has_h2_client) if (self.h2) |session| {
+            if (self.h2_stream) |s| s.release();
+            self.h2_stream = null;
+            session.close();
+            self.h2 = null;
+        };
         if (build_options.use_tls) {
             // See server.zig `Connection.deinit`: only a TLS module that owns
             // per-connection state declares `deinit`.
@@ -707,6 +740,16 @@ pub const Connection = struct {
         self.parser.reset();
         try self.parser.init(&self.parsed_response, self.max_response_headers);
         self.closing = false;
+
+        // HTTP/2: the stream goes (reset if its body is unread), and the
+        // connection stays while the server takes requests on it. The
+        // session owns the reader.
+        if (comptime has_h2_client) if (self.h2) |session| {
+            if (self.h2_stream) |st| st.release();
+            self.h2_stream = null;
+            if (!session.isOpen()) return error.ConnectionClosed;
+            return;
+        };
 
         // As part of reading body, we shrank the buffer
         const buffered = self.reader.buffered();
@@ -749,12 +792,26 @@ pub const Connection = struct {
         return self.protocol == protocol and self.port == match_port and std.ascii.eqlIgnoreCase(self.host(), match_host);
     }
 
+    /// Whether the response body may still be on the wire. Over HTTP/2 it
+    /// never is in the way: releasing the stream resets it.
+    fn bodyPending(self: *Connection) bool {
+        if (comptime has_h2_client) if (self.h2 != null) return false;
+        return !self.parser.isBodyComplete();
+    }
+
     /// Release this connection back to its pool, handling keep-alive logic.
     /// A response body that wasn't fully read is drained in the background
     /// when it is small enough, and the connection closed otherwise.
     pub fn release(self: *Connection) void {
         // Increment request count
         self.request_count +|= 1;
+
+        // HTTP/2: no keep-alive headers and no body to drain; `reset`
+        // releases the stream.
+        if (comptime has_h2_client) if (self.h2 != null) {
+            self.pool.release(self);
+            return;
+        };
 
         // Check basic keep-alive from Connection header
         if (!self.parser.shouldKeepAlive()) {
@@ -817,6 +874,10 @@ pub const ClientResponse = struct {
 
     // Connection reference for cleanup (optional for testing)
     owner: ?*Connection = null,
+
+    /// The body as an HTTP/2 stream delivers it, unframed, in place of
+    /// `parser` and `transport`.
+    raw: ?BodySource = null,
 
     /// Release the connection back to the pool (or close if not reusable).
     pub fn deinit(self: *ClientResponse) void {
@@ -919,6 +980,7 @@ pub const ClientResponse = struct {
     /// streams cannot then ask for the body whole.
     pub fn reader(self: *ClientResponse, buffer: []u8) !ResponseBodyReader {
         var r = ResponseBodyReader.init(self.parser, self.transport, buffer);
+        r.raw = self.raw;
 
         // Once the body is in memory there is nothing left on the wire, and
         // what is cached has already been decoded.
@@ -1086,8 +1148,13 @@ pub const Client = struct {
         // (e.g. the WebSocket upgrade path) must pass false.
         advertise_http2: bool,
     ) !*Connection {
-        return self.pool.acquire(host, port, protocol, unix_socket_path) orelse
-            self.dialConnection(host, port, protocol, tls_config, unix_socket_path, advertise_http2);
+        if (self.pool.acquire(host, port, protocol, unix_socket_path)) |conn| {
+            if (advertise_http2 or conn.http_version != .http_2) return conn;
+            // An HTTP/2 connection cannot carry what this is for (a
+            // WebSocket upgrade); it stays for the next fetch.
+            self.pool.release(conn);
+        }
+        return self.dialConnection(host, port, protocol, tls_config, unix_socket_path, advertise_http2);
     }
 
     /// Open a new connection, bypassing the pool.
@@ -1220,7 +1287,7 @@ pub const Client = struct {
         // Acquire or create a connection. The redirect path releases it early
         // and continues with fallible work, so the errdefer must be disarmed
         // after that release to avoid releasing the connection twice.
-        const advertise_http2 = build_options.use_http2 and self.config.http2 and state.protocol == .https;
+        const advertise_http2 = has_h2_client and self.config.http2 and state.protocol == .https;
         var reused = true;
         var conn = self.pool.acquire(host, state.port, state.protocol, state.options.unix_socket_path) orelse blk: {
             reused = false;
@@ -1245,7 +1312,7 @@ pub const Client = struct {
         // From here on an error leaves the body where it is, and the
         // errdefer above pools the connection. A body still on the wire
         // would be read as the next response, so it may not go back.
-        errdefer if (!conn_released and !conn.parser.isBodyComplete()) {
+        errdefer if (!conn_released and conn.bodyPending()) {
             conn.closing = true;
         };
 
@@ -1270,7 +1337,7 @@ pub const Client = struct {
 
                 // Drain small redirect bodies (up to 2KB) so the connection can
                 // be returned to the pool rather than closed.
-                if (!conn.closing and !conn.parser.isBodyComplete()) {
+                if (!conn.closing and conn.bodyPending()) {
                     const max_drain = 2048;
                     var drain_buf: [1024]u8 = undefined;
                     // No decoding: this is throwing the body away to keep the
@@ -1362,6 +1429,7 @@ pub const Client = struct {
             .max_response_size = self.config.max_response_size,
             .decompress = state.options.decompress,
             .owner = conn,
+            .raw = if (comptime has_h2_client) if (conn.h2_stream) |st| .{ .reader = st.reader(), .err = h2BodyError } else null else null,
         };
         // Under the request's deadline, which ends with this call. A body
         // left on the wire is the caller's to read, on the caller's time.
@@ -1372,10 +1440,10 @@ pub const Client = struct {
     /// Writes the request on `conn` and reads the response head. `lost` is
     /// set when the connection failed before any of the response arrived.
     fn sendRequest(self: *Client, conn: *Connection, state: FetchState, host: []const u8, lost: *bool) !void {
-        // HTTP/2 was negotiated via ALPN but the h2 path isn't implemented yet.
-        // The TLS connection is already committed to h2 (we can't speak HTTP/1.1
-        // over it), so don't pool it — mark closing so release() tears it down.
         if (conn.http_version == .http_2) {
+            if (comptime has_h2_client) return self.sendRequestH2(conn, state, host, lost);
+            // Never offered without a client to speak it; and the TLS
+            // connection is committed to h2, so it is not pooled.
             conn.closing = true;
             return error.Http2NotImplemented;
         }
@@ -1442,6 +1510,78 @@ pub const Client = struct {
                 return err;
             };
         }
+    }
+
+    /// `sendRequest` over HTTP/2: the request as one stream, and its
+    /// response head in `conn.parsed_response` as the HTTP/1.1 parser
+    /// leaves it. The body stays on the stream for `ClientResponse`.
+    fn sendRequestH2(self: *Client, conn: *Connection, state: FetchState, host: []const u8, lost: *bool) !void {
+        if (comptime !has_h2_client) unreachable;
+        try http.validateHeaderValue(host);
+        const arena = conn.arena.allocator();
+        const path = uriPath(state.uri);
+        var fields: H2Fields = .{ .arena = arena };
+        try fields.list.appendSlice(arena, &.{
+            .{ .name = ":method", .value = state.options.method.name() },
+            .{ .name = ":scheme", .value = "https" },
+            .{ .name = ":path", .value = if (state.uri.query) |query|
+                try std.fmt.allocPrint(arena, "{s}?{s}", .{ path, query.percent_encoded })
+            else
+                path },
+        });
+        try requestFields(.{
+            .method = state.options.method,
+            .uri = state.uri,
+            .host = host,
+            .port = state.port,
+            .protocol = state.protocol,
+            .headers = state.options.headers,
+            .body = state.options.body,
+            .decompress = state.options.decompress,
+            .strip_sensitive_headers = state.strip_sensitive_headers,
+            .strip_body_headers = state.strip_body_headers,
+            .referer = state.referer,
+            .user_agent = self.config.user_agent,
+        }, &fields, H2Fields.add);
+
+        // The fetch's deadline bounds every wait below; the stream has
+        // none of its own. The body goes out as the server takes it while
+        // this waits for the head, so a server that answers as it reads
+        // cannot stall the request.
+        const stream = conn.h2.?.request(fields.list.items, .{ .body_bytes = state.options.body, .timeout = .none }) catch |err| {
+            // The server sent GOAWAY, or the connection failed, before
+            // this request: none of it went out.
+            conn.closing = true;
+            lost.* = err == error.ConnectionClosed;
+            return err;
+        };
+        conn.h2_stream = stream;
+        stream.waitHead() catch |err| {
+            // The connection went with nothing of the response: as an
+            // HTTP/1.1 connection lost before the response, which a reused
+            // one may retry.
+            if (err == error.ConnectionClosed) {
+                conn.closing = true;
+                lost.* = true;
+            }
+            return err;
+        };
+
+        const parsed = &conn.parsed_response;
+        parsed.status = try http.Status.fromCode(stream.status);
+        parsed.version_major = 2;
+        parsed.version_minor = 0;
+        for (stream.headers.items) |h| try parsed.headers.add(try arena.dupe(u8, h.name), try arena.dupe(u8, h.value));
+        // As the parser's `onHeadersComplete` reads them.
+        if (parsed.headers.get("Content-Type")) |v| parsed.content_type = ContentType.fromContentType(v);
+        if (parsed.headers.get("Content-Encoding")) |v| parsed.content_encoding = ContentEncoding.fromString(v);
+        if (parsed.headers.get("Content-Length")) |v| parsed.content_length = std.fmt.parseInt(usize, v, 10) catch null;
+        conn.parser.state.headers_complete = true;
+        // A response that has no body whatever its headers say, so nothing
+        // starts decoding one.
+        conn.parser.state.message_complete = state.options.method == .head or
+            parsed.status == .no_content or parsed.status == .not_modified or
+            parsed.content_length == 0;
     }
 };
 
@@ -1545,19 +1685,40 @@ fn writeRequest(writer: *std.Io.Writer, opts: WriteRequestOptions) !void {
         try writer.print("{s} {s} HTTP/1.1\r\n", .{ opts.method.name(), path });
     }
 
+    try requestFields(opts, writer, writeField);
+
+    // End of headers
+    try writer.writeAll("\r\n");
+
+    // Body
+    if (opts.body) |b| {
+        try writer.writeAll(b);
+    }
+}
+
+fn writeField(writer: *std.Io.Writer, name: []const u8, value: []const u8) !void {
+    try writer.print("{s}: {s}\r\n", .{ name, value });
+}
+
+/// The request's header fields, `Host` first, each validated and handed to
+/// `emit(sink, name, value)`: what HTTP/1.1 writes after the request line
+/// and HTTP/2 sends after its pseudo-headers. `value` may be a temporary.
+fn requestFields(opts: WriteRequestOptions, sink: anytype, comptime emit: anytype) !void {
     // Host header
+    var host_buf: [300]u8 = undefined;
     if ((opts.protocol == .http and opts.port == 80) or (opts.protocol == .https and opts.port == 443)) {
-        try writer.print("Host: {s}\r\n", .{opts.host});
+        try emit(sink, "Host", opts.host);
     } else {
-        try writer.print("Host: {s}:{d}\r\n", .{ opts.host, opts.port });
+        try emit(sink, "Host", try std.fmt.bufPrint(&host_buf, "{s}:{d}", .{ opts.host, opts.port }));
     }
 
     // Content-Length for body. A method that usually carries one says so
     // even when there is none: some servers answer 411 otherwise.
+    var length_buf: [24]u8 = undefined;
     if (opts.body) |b| {
-        try writer.print("Content-Length: {d}\r\n", .{b.len});
+        try emit(sink, "Content-Length", try std.fmt.bufPrint(&length_buf, "{d}", .{b.len}));
     } else if (opts.method == .post or opts.method == .put or opts.method == .patch) {
-        try writer.writeAll("Content-Length: 0\r\n");
+        try emit(sink, "Content-Length", "0");
     }
 
     // User-provided headers
@@ -1591,7 +1752,7 @@ fn writeRequest(writer: *std.Io.Writer, opts: WriteRequestOptions) !void {
 
             try http.validateHeaderName(entry.key);
             try http.validateHeaderValue(entry.value);
-            try writer.print("{s}: {s}\r\n", .{ entry.key, entry.value });
+            try emit(sink, entry.key, entry.value);
         }
     }
 
@@ -1599,7 +1760,7 @@ fn writeRequest(writer: *std.Io.Writer, opts: WriteRequestOptions) !void {
     if (opts.referer) |referer| {
         if (!has_referer) {
             try http.validateHeaderValue(referer);
-            try writer.print("Referer: {s}\r\n", .{referer});
+            try emit(sink, "Referer", referer);
         }
     }
 
@@ -1607,23 +1768,44 @@ fn writeRequest(writer: *std.Io.Writer, opts: WriteRequestOptions) !void {
     if (opts.user_agent) |ua| {
         if (!has_user_agent) {
             try http.validateHeaderValue(ua);
-            try writer.print("User-Agent: {s}\r\n", .{ua});
+            try emit(sink, "User-Agent", ua);
         }
     }
 
     // Add default Accept-Encoding if decompress enabled and user didn't
     // provide one, and only for codings this build can undo.
     if (build_options.use_zlib and opts.decompress and !has_accept_encoding) {
-        try writer.writeAll("Accept-Encoding: gzip, deflate\r\n");
+        try emit(sink, "Accept-Encoding", "gzip, deflate");
     }
+}
 
-    // End of headers
-    try writer.writeAll("\r\n");
+/// The request as HTTP/2 header fields: the pseudo-headers, then the
+/// fields `requestFields` gives, `Host` as `:authority`, names in lower
+/// case, without the fields HTTP/2 forbids (RFC 9113 §8.2.2). Copied into
+/// `arena`.
+const H2Fields = if (has_h2_client) struct {
+    arena: std.mem.Allocator,
+    list: std.ArrayList(h2_client.Header) = .empty,
 
-    // Body
-    if (opts.body) |b| {
-        try writer.writeAll(b);
+    fn add(self: *@This(), name: []const u8, value: []const u8) !void {
+        const connection_specific = [_][]const u8{ "connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade" };
+        for (connection_specific) |n| if (std.ascii.eqlIgnoreCase(name, n)) return;
+        if (std.ascii.eqlIgnoreCase(name, "te") and !std.ascii.eqlIgnoreCase(value, "trailers")) return;
+        const lower = if (std.ascii.eqlIgnoreCase(name, "host")) ":authority" else try std.ascii.allocLowerString(self.arena, name);
+        try self.list.append(self.arena, .{ .name = lower, .value = try self.arena.dupe(u8, value) });
     }
+} else void;
+
+/// What a failed read of an HTTP/2 response body was, in the transport's
+/// terms: a reset stream or a lost connection is the peer resetting it.
+fn h2BodyError(reader: *std.Io.Reader) ?Transport.ReadError {
+    if (comptime !has_h2_client) unreachable;
+    const err = h2_client.Stream.ofReader(reader).readError() orelse return null;
+    return switch (err) {
+        error.Canceled => error.Canceled,
+        error.Timeout => error.ConnectionTimedOut,
+        else => error.ConnectionResetByPeer,
+    };
 }
 
 /// Returns true if sub is the same domain as parent, or a subdomain of it.
