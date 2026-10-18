@@ -1365,6 +1365,12 @@ pub fn Server(comptime Ctx: type) type {
             applyForwardedFn(request, connection.peerAddress(), self.config.trusted_proxy_hops);
         }
 
+        /// `applyForwarded` for an engine with no `Connection` (HTTP/3 over
+        /// UDP): the peer address is given directly.
+        pub fn applyForwardedFrom(self: *const Self, request: *Request, peer: std.Io.net.IpAddress) void {
+            applyForwardedFn(request, peer, self.config.trusted_proxy_hops);
+        }
+
         /// Routes `req` and runs its handler, with the middleware, writing to
         /// `res`. For a protocol engine other than the HTTP/1.x loop -- an
         /// HTTP/2 stream, whose request and response are built over a body

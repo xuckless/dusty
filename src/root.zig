@@ -13,6 +13,9 @@ pub const Request = @import("request.zig").Request;
 pub const Response = @import("response.zig").Response;
 /// Where a response goes when a protocol engine (HTTP/2) frames it; see `Response.initSink`.
 pub const Sink = @import("sink.zig").Sink;
+/// Task placement on zio's executors, for protocol engines outside dusty
+/// (HTTP/3) that keep a connection's tasks on one executor.
+pub const placement = @import("placement.zig");
 /// A request body delivered unframed by a protocol engine; see `Request.body_source`.
 pub const BodySource = @import("request.zig").BodySource;
 pub const BodyWriter = @import("response.zig").BodyWriter;
