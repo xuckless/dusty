@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const tls = @import("tls");
 const build_options = @import("build_options");
 
@@ -435,6 +436,9 @@ pub fn Server(comptime Ctx: type) type {
             config: *const Listener,
             address: Address,
             server: std.Io.net.Server,
+            /// Under `socket_per_acceptor`, the sockets for every accept
+            /// loop after the first, which takes `server`.
+            extra_servers: []std.Io.net.Server = &.{},
             tls_auth: ?tls.config.CertKeyPair = null,
             tls_client_ca: ?std.crypto.Certificate.Bundle = null,
             client_auth_mode: ServerConfig.Tls.ClientAuth.Mode = .require,
@@ -453,8 +457,17 @@ pub fn Server(comptime Ctx: type) type {
             }
 
             fn close(l: *ActiveListener, io: std.Io, allocator: std.mem.Allocator) void {
+                for (l.extra_servers) |*s| s.deinit(io);
+                allocator.free(l.extra_servers);
+                l.extra_servers = &.{};
                 l.server.deinit(io);
                 l.freeTls(allocator);
+            }
+
+            /// The socket the `index`th accept loop takes connections from.
+            fn socketFor(l: *ActiveListener, index: usize) *std.Io.net.Server {
+                if (index == 0 or l.extra_servers.len == 0) return &l.server;
+                return &l.extra_servers[index - 1];
             }
         };
 
@@ -465,6 +478,9 @@ pub fn Server(comptime Ctx: type) type {
             listener: *ActiveListener,
             /// Which executor the loop runs on, where the runtime has several.
             executor: usize = 0,
+            /// The listener's socket, or under `socket_per_acceptor` one of
+            /// its own.
+            socket: *std.Io.net.Server,
             /// Why this loop gave up, once it has.
             err: ?AcceptError = null,
         };
@@ -577,7 +593,7 @@ pub fn Server(comptime Ctx: type) type {
             var opened: usize = 0;
             defer for (active[0..opened]) |*l| l.close(self.io, self.allocator);
             for (listeners, active, addresses) |*cfg, *l, *address| {
-                l.* = try self.open(cfg, cfg.kernel_backlog orelse default_backlog);
+                l.* = try self.open(cfg, cfg.kernel_backlog orelse default_backlog, cfg.acceptorCountFor(cpu_count, executors));
                 opened += 1;
                 address.* = l.address;
             }
@@ -585,7 +601,7 @@ pub fn Server(comptime Ctx: type) type {
             var next_acceptor: usize = 0;
             for (active) |*l| {
                 const n = l.config.acceptorCountFor(cpu_count, executors);
-                for (acceptors[next_acceptor..][0..n], 0..) |*a, j| a.* = .{ .listener = l, .executor = j };
+                for (acceptors[next_acceptor..][0..n], 0..) |*a, j| a.* = .{ .listener = l, .executor = j, .socket = l.socketFor(j) };
                 next_acceptor += n;
             }
 
@@ -620,8 +636,10 @@ pub fn Server(comptime Ctx: type) type {
                     // served, only with fewer accepts waiting. The loops for
                     // a listener are spawned in a row, and a first one that
                     // fails ends the run below, so a predecessor on the same
-                    // listener means one is running.
-                    if (i > 0 and acceptors[i - 1].listener == a.listener) {
+                    // listener means one is running. Not so for a socket of
+                    // its own: the kernel keeps handing it connections that
+                    // no loop would ever take.
+                    if (i > 0 and acceptors[i - 1].listener == a.listener and a.socket == acceptors[i - 1].socket) {
                         log.warn("Failed to spawn an extra accept loop for {f}: {}", .{ a.listener.address, err });
                         continue;
                     }
@@ -656,7 +674,7 @@ pub fn Server(comptime Ctx: type) type {
         }
 
         /// Loads the listener's TLS material and binds its socket.
-        fn open(self: *Self, cfg: *const Listener, kernel_backlog: u31) !ActiveListener {
+        fn open(self: *Self, cfg: *const Listener, kernel_backlog: u31, acceptor_count: usize) !ActiveListener {
             var l: ActiveListener = .{ .config = cfg, .address = cfg.address, .server = undefined };
             errdefer l.freeTls(self.allocator);
 
@@ -705,6 +723,8 @@ pub fn Server(comptime Ctx: type) type {
                 }
             }
 
+            if (cfg.socket_per_acceptor) try checkSocketPerAcceptor(cfg);
+
             l.server = switch (cfg.address) {
                 .ip => |ip| try ip.listen(self.io, .{
                     .kernel_backlog = kernel_backlog,
@@ -712,8 +732,43 @@ pub fn Server(comptime Ctx: type) type {
                 }),
                 .unix => |unix| try unix.listen(self.io, .{ .kernel_backlog = kernel_backlog }),
             };
+            errdefer l.server.deinit(self.io);
             if (cfg.address == .ip) l.address = .{ .ip = l.server.socket.address };
+
+            if (cfg.socket_per_acceptor and acceptor_count > 1) {
+                const extra = try self.allocator.alloc(std.Io.net.Server, acceptor_count - 1);
+                var bound: usize = 0;
+                errdefer {
+                    for (extra[0..bound]) |*s| s.deinit(self.io);
+                    self.allocator.free(extra);
+                }
+                // The address the first socket got, so a listener given port
+                // zero binds every socket to the same port.
+                for (extra) |*s| {
+                    s.* = try l.address.ip.listen(self.io, .{
+                        .kernel_backlog = kernel_backlog,
+                        .reuse_address = true,
+                    });
+                    bound += 1;
+                }
+                l.extra_servers = extra;
+            }
             return l;
+        }
+
+        fn checkSocketPerAcceptor(cfg: *const Listener) error{SocketPerAcceptorUnsupported}!void {
+            if (builtin.os.tag != .linux) {
+                log.err("socket_per_acceptor needs Linux, where SO_REUSEPORT spreads connections across the sockets", .{});
+                return error.SocketPerAcceptorUnsupported;
+            }
+            if (cfg.address != .ip) {
+                log.err("socket_per_acceptor needs an IP address, not a unix socket", .{});
+                return error.SocketPerAcceptorUnsupported;
+            }
+            if (!cfg.reuse_address) {
+                log.err("socket_per_acceptor needs reuse_address, which sets SO_REUSEPORT", .{});
+                return error.SocketPerAcceptorUnsupported;
+            }
         }
 
         /// A cancel is the normal end and is reported to nobody: the group
@@ -725,7 +780,7 @@ pub fn Server(comptime Ctx: type) type {
             connections: *std.Io.Group,
             stopped: *std.Io.Event,
         ) std.Io.Cancelable!void {
-            self.acceptConnections(a.listener, connections) catch |err| switch (err) {
+            self.acceptConnections(a.listener, a.socket, connections) catch |err| switch (err) {
                 error.Canceled => return error.Canceled,
                 else => {
                     log.err("Listener {f} failed: {}", .{ a.listener.address, err });
@@ -735,7 +790,7 @@ pub fn Server(comptime Ctx: type) type {
             };
         }
 
-        fn acceptConnections(self: *Self, l: *ActiveListener, connections: *std.Io.Group) !void {
+        fn acceptConnections(self: *Self, l: *ActiveListener, socket: *std.Io.net.Server, connections: *std.Io.Group) !void {
             // Grows while accepting keeps failing for want of resources, and
             // is reset by the first connection that gets through.
             var backoff_ms: u64 = 0;
@@ -743,7 +798,7 @@ pub fn Server(comptime Ctx: type) type {
             while (true) {
                 try self.waitForConnectionSlot();
 
-                const stream = l.server.accept(self.io) catch |err| switch (err) {
+                const stream = socket.accept(self.io) catch |err| switch (err) {
                     // One connection went away between its SYN and our
                     // accept, which says nothing about the listener. Routine
                     // on a public address, where clients reset and scanners

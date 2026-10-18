@@ -76,6 +76,7 @@ This release expands how servers listen and send responses, while improving thro
 
 - Listener configuration has moved to `ServerConfig.listeners`, which defaults to `127.0.0.1:8080` when omitted or empty, and servers now start with `Server.run()`. `Server.listen()` and `ServerConfig.tls` have been removed; move TLS, backlog, address-reuse, and accept-loop settings into each `Listener`.
 - `Response.writeHeader` is no longer public. Use `Response.stream()` when headers must be sent before the body.
+- Added `Listener.socket_per_acceptor`, which gives each accept loop its own SO_REUSEPORT socket on the listener's address so the kernel spreads new connections over separate accept queues. Off by default: it scales further when nearly every request opens a new connection, at the cost of tail latency. Linux only.
 
 ## [0.3.1] - 2026-09-21
 

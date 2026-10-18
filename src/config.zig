@@ -108,6 +108,17 @@ pub const Listener = struct {
     /// that, more loops on one socket stop paying for themselves, and on
     /// short connections start to cost.
     acceptors: ?u16 = null,
+    /// Gives each accept loop a socket of its own instead of sharing one,
+    /// all bound to the same address with SO_REUSEPORT, so the kernel
+    /// spreads connections over as many accept queues as there are loops.
+    /// That scales further than a shared queue when nearly every request
+    /// comes on a new connection. The kernel picks a socket by hashing the
+    /// connection, not by which loop is free, so a busy loop keeps getting
+    /// its share and tail latency is worse under load; and a connection
+    /// still queued on a socket when it closes is reset rather than handed
+    /// to another. Linux only, and needs an IP address with
+    /// `reuse_address` set.
+    socket_per_acceptor: bool = false,
 
     /// The number of accept loops, with `cpu_count` standing in for the
     /// CPUs the process may use when `acceptors` is null.
