@@ -54,6 +54,9 @@ pub const Request = struct {
     /// trusted proxy, the proxy's (PROXY protocol v2's SSL TLV, or
     /// `X-Forwarded-Proto` under `ServerConfig.trusted_proxy_hops`).
     secure: bool = false,
+    /// The `:protocol` of an HTTP/2 extended CONNECT (RFC 8441), such as
+    /// "websocket"; null otherwise. Such a request is routed as a GET.
+    protocol: ?[]const u8 = null,
     /// `X-Forwarded-Host` from the nearest trusted proxy, under
     /// `ServerConfig.trusted_proxy_hops`. See `host`.
     forwarded_host: ?[]const u8 = null,

@@ -1207,6 +1207,8 @@ pub const Response = struct {
     fn negotiateCompression(self: *const Response) Compression {
         if (!(build_options.use_zlib or build_options.use_zstd) or !self.compress) return .off;
         if (self.file != null) return .off;
+        // A tunnel (RFC 8441), not a representation.
+        if (self.request) |r| if (r.protocol != null) return .off;
         const not_modified = self.status == .not_modified;
         if (!not_modified and !statusHasBody(self.status)) return .off;
         if (self.status == .partial_content) return .off;

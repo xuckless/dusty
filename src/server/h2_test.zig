@@ -111,16 +111,23 @@ const TestClient = struct {
     }
 
     fn request(self: *TestClient, method: []const u8, path: []const u8, body: ?[]const u8) !i32 {
-        const nva = [_]c.nghttp2_nv{
+        return self.requestProtocol(method, path, null, body);
+    }
+
+    /// `request`, with a `:protocol` for an extended CONNECT (RFC 8441).
+    fn requestProtocol(self: *TestClient, method: []const u8, path: []const u8, protocol: ?[]const u8, body: ?[]const u8) !i32 {
+        const all = [_]c.nghttp2_nv{
             nv(":method", method),
             nv(":path", path),
             nv(":scheme", "http"),
             nv(":authority", "localhost"),
+            nv(":protocol", protocol orelse ""),
         };
+        const nva = if (protocol != null) all[0..] else all[0..4];
         const resp = try self.gpa.create(Resp);
         resp.* = .{ .send = body orelse "" };
         var provider: c.nghttp2_data_provider2 = .{ .source = .{ .ptr = resp }, .read_callback = provide };
-        const id = c.nghttp2_submit_request2(self.session, null, &nva, nva.len, if (body != null) &provider else null, resp);
+        const id = c.nghttp2_submit_request2(self.session, null, nva.ptr, nva.len, if (body != null) &provider else null, resp);
         if (id < 0) return error.Http2Submit;
         try self.responses.put(self.gpa, id, resp);
         return id;
@@ -625,4 +632,33 @@ test "HTTP/2: a PROXY protocol header ahead of TLS names the client of an h2 str
     const id = try client.request("GET", "/who", null);
     try client.run();
     try std.testing.expectEqualStrings("192.0.2.44:40000 secure=true", client.get(id).body.items);
+}
+
+test "HTTP/2: an extended CONNECT (RFC 8441) reaches a GET route with Request.protocol set" {
+    const io = std.testing.io;
+    var fx: Fixture = undefined;
+    try fx.start(io);
+    defer fx.stop(io);
+    fx.server.router.get("/tunnel", struct {
+        fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+            try std.testing.expectEqualStrings("websocket", req.protocol.?);
+            res.compress = true; // never applies to a tunnel
+            try Handlers.echo(req, res);
+        }
+    }.handle);
+
+    var client: TestClient = undefined;
+    try client.init(std.testing.allocator, io, fx.server.address.ip);
+    defer client.deinit();
+    // The server's SETTINGS (with ENABLE_CONNECT_PROTOCOL) must be in before
+    // nghttp2 lets a client send :protocol.
+    const warm = try client.request("GET", "/hello", null);
+    try client.run();
+    try std.testing.expectEqual(@as(u16, 200), client.get(warm).status);
+    try std.testing.expectEqual(@as(u32, 1), c.nghttp2_session_get_remote_settings(client.session, c.NGHTTP2_SETTINGS_ENABLE_CONNECT_PROTOCOL));
+
+    const id = try client.requestProtocol("CONNECT", "/tunnel", "websocket", "tunnelled bytes");
+    try client.run();
+    try std.testing.expectEqual(@as(u16, 200), client.get(id).status);
+    try std.testing.expectEqualStrings("tunnelled bytes", client.get(id).body.items);
 }
