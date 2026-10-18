@@ -504,6 +504,11 @@ pub fn Server(comptime Ctx: type) type {
         /// returned.
         addresses: []const Address = &.{},
         ready: std.Io.Event,
+        /// Set when the drain starts (and never reset). Long-lived handlers
+        /// (WebSockets, event streams) can wait on it, through
+        /// `Request.drain`, to finish early rather than be cut off at
+        /// `timeout.shutdown`.
+        draining: std.Io.Event = .unset,
         _middleware_registry: std.SinglyLinkedList,
         request_buffers: RequestBuffersPool,
 
@@ -697,6 +702,7 @@ pub fn Server(comptime Ctx: type) type {
             var connections: std.Io.Group = .init;
             defer {
                 _ = self.busy.fetchOr(.{ .draining = true }, .release);
+                self.draining.set(self.io);
                 connections.cancel(self.io);
             }
 
@@ -998,6 +1004,7 @@ pub fn Server(comptime Ctx: type) type {
 
             log.info("Graceful shutdown requested", .{});
             _ = self.busy.fetchOr(.{ .draining = true }, .acq_rel);
+            self.draining.set(self.io);
 
             // HTTP/2 connections get a two-phase GOAWAY (RFC 9113 §6.8): a
             // notice now, the final one a round trip later, when the PING
@@ -1493,6 +1500,7 @@ pub fn Server(comptime Ctx: type) type {
                 .remote_address = connection.peerAddress(),
                 .listener = l.config,
                 .secure = (build_options.use_tls and l.tls_auth != null) or connection.proxied_secure,
+                .drain = &self.draining,
                 ._timeout_context = timer,
                 ._set_timeout = setRequestTimeout,
             };

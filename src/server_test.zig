@@ -2075,6 +2075,59 @@ test "Server: a request arriving during the shutdown drain is refused, not serve
     try shutdown_future.await(io);
 }
 
+test "Server: a long-lived handler learns of the drain through req.drain and ends it early" {
+    const io = std.testing.io;
+
+    const sync = struct {
+        var started: std.Io.Event = .unset;
+    };
+    sync.started = .unset;
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .listeners = loopback,
+        .timeout = .{ .shutdown = .fromSeconds(30) },
+    }, {});
+    defer server.deinit();
+
+    // Would hold the drain for its whole budget if it did not listen.
+    server.router.get("/stream", struct {
+        fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+            try std.testing.expect(!req.drain.?.isSet());
+            sync.started.set(req.io);
+            try req.drain.?.wait(req.io);
+            res.body = "drained";
+        }
+    }.handle);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) anyerror!void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+    try server.ready.wait(io);
+
+    const conn = try server.address.ip.connect(io, .{ .mode = .stream });
+    defer conn.close(io);
+    var write_buf: [256]u8 = undefined;
+    var writer = conn.writer(io, &write_buf);
+    try writer.interface.writeAll("GET /stream HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    try writer.interface.flush();
+    try sync.started.wait(io);
+
+    const start: std.Io.Clock.Timestamp = .now(io, .awake);
+    try std.testing.expectError(error.Canceled, server_future.cancel(io));
+    try std.testing.expect(start.durationTo(.now(io, .awake)).raw.toMilliseconds() < 5000);
+
+    var read_buf: [1024]u8 = undefined;
+    var reader = conn.reader(io, &read_buf);
+    var status: [64]u8 = undefined;
+    var body: [16]u8 = undefined;
+    const resp = try readResponse(&reader.interface, &status, &body);
+    try std.testing.expectStringStartsWith(resp.status, "HTTP/1.1 200 ");
+    try std.testing.expectEqualStrings("drained", resp.body);
+}
+
 test "Server: graceful shutdown closes idle connections without waiting out the budget" {
     try expectIdleConnectionsClosedOnShutdown(.{});
 }
