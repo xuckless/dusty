@@ -2601,6 +2601,60 @@ test "Server: a head that is not HTTP/1.x gets a 400 and a clean close, an HTTP/
     try client_future.await(io);
 }
 
+test "Server: on an h2c listener, a first line with no method is an invalid HTTP/2 preface: closed without a 400" {
+    // h2spec http2/3.5 sends "INVALID CONNECTION PREFACE" and wants the
+    // connection closed (RFC 9113 section 3.4), with nothing read first.
+    if (!@import("build_options").use_http2) return error.SkipZigTest;
+    const io = std.testing.io;
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .listeners = &.{.{ .address = loopback_addr, .http2_prior_knowledge = true }},
+    }, {});
+    defer server.deinit();
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            s.run() catch |err| {
+                if (err != error.Canceled) return err;
+            };
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    var client_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void), _io: std.Io) !void {
+            try s.waitReady(_io);
+            const cases = [_]struct { []const u8, bool }{
+                .{ "INVALID CONNECTION PREFACE\r\n\r\n", false },
+                .{ "PRI * HTTP/2.0\r\n\r\nXX\r\n\r\n", false },
+                // Still HTTP/1.1 enough for a 400.
+                .{ "GET / HTTP/1.1\r\nBad Header\r\n\r\n", true },
+                .{ "GET / HTTP/9.9\r\nHost: x\r\n\r\n", true },
+            };
+            for (cases) |c| {
+                const stream = try s.address.ip.connect(_io, .{ .mode = .stream });
+                defer stream.close(_io);
+                var write_buf: [256]u8 = undefined;
+                var writer = stream.writer(_io, &write_buf);
+                try writer.interface.writeAll(c[0]);
+                try writer.interface.flush();
+                var read_buf: [1024]u8 = undefined;
+                var reader = stream.reader(_io, &read_buf);
+                // A FIN, not a reset, and nothing before it but the 400.
+                const answer = try reader.interface.allocRemaining(std.testing.allocator, .limited(1024));
+                defer std.testing.allocator.free(answer);
+                if (c[1]) {
+                    try std.testing.expectStringStartsWith(answer, "HTTP/1.1 400 Bad Request\r\n");
+                } else {
+                    try std.testing.expectEqualStrings("", answer);
+                }
+            }
+        }
+    }.run, .{ &server, io });
+
+    try client_future.await(io);
+}
+
 test "Server: Response.abort closes the connection under a streamed body" {
     const io = std.testing.io;
 

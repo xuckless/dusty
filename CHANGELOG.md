@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- On a listener that also takes HTTP/2 with prior knowledge, a first
+  request line that does not start with a method is taken for an invalid
+  HTTP/2 preface (RFC 9113 section 3.4): the connection is closed without
+  the 400, which an HTTP/2 client would read as a broken frame (h2spec
+  http2/3.5 over h2c). A malformed HTTP/1.x head after a method still gets
+  the 400.
 - Errors named after a status answer with it: a handler or middleware that
   returns `error.Unauthorized` gets a 401, `error.TooManyRequests` a 429,
   `error.ServiceUnavailable` a 503. Any standard 4xx or 5xx counts, by its

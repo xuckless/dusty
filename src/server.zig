@@ -1847,6 +1847,14 @@ pub fn Server(comptime Ctx: type) type {
                     // would read an HTTP/1.1 answer as a frame. Logged at
                     // info, as `runConnection` logs the other malformed
                     // requests: any peer can send one.
+                    //
+                    // So does a first request line that does not start with
+                    // a method on a listener that also takes HTTP/2 with
+                    // prior knowledge: it may be an HTTP/2 client's preface
+                    // gone wrong, which RFC 9113 section 3.4 makes a
+                    // connection error, and that client would read a 400 as
+                    // a broken frame. A malformed HTTP/1.x head after a
+                    // method still gets the 400.
                     error.InvalidMethod,
                     error.InvalidUrl,
                     error.InvalidHeaderToken,
@@ -1858,7 +1866,10 @@ pub fn Server(comptime Ctx: type) type {
                     error.ParseFailed,
                     => |e| {
                         log.info("Malformed request: {}", .{e});
-                        if (!std.mem.startsWith(u8, connection.reader.buffered(), h2_preface_line)) {
+                        const h2c = build_options.use_http2 and l.config.http2_prior_knowledge and
+                            !(build_options.use_tls and l.config.tls != null);
+                        const bad_preface = h2c and first and e == error.InvalidMethod;
+                        if (!bad_preface and !std.mem.startsWith(u8, connection.reader.buffered(), h2_preface_line)) {
                             sendBadRequest(connection.writer) catch
                                 return connection.getWriteError() orelse error.Unexpected;
                         }
