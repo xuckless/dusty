@@ -11,6 +11,11 @@ pub const TlsCa = union(enum) {
     file: TlsPath,
     /// A directory of PEM files, each holding one or more certificates.
     dir: TlsPath,
+    /// One or more PEM certificates in memory: a CA that comes from a secret
+    /// store or the environment, or a development certificate made at
+    /// startup. Read when the trust store is loaded (a client's first HTTPS
+    /// request, a listener's start); it must stay alive until then.
+    pem: []const u8,
     /// Trust nothing. Rejected unless the side using it says otherwise.
     none,
 
@@ -35,11 +40,39 @@ pub const TlsCa = union(enum) {
                 src.dir orelse std.Io.Dir.cwd(),
                 src.path,
             ),
+            .pem => |text| try addCertsFromPem(&bundle, allocator, text, now.toSeconds()),
             .none => {},
         }
         return bundle;
     }
 };
+
+/// `std.crypto.Certificate.Bundle.addCertsFromFile` for PEM text in memory:
+/// every `BEGIN CERTIFICATE` block, decoded and parsed; expired ones are
+/// skipped, as there.
+pub fn addCertsFromPem(
+    bundle: *std.crypto.Certificate.Bundle,
+    allocator: std.mem.Allocator,
+    pem: []const u8,
+    now_sec: i64,
+) !void {
+    const begin_marker = "-----BEGIN CERTIFICATE-----";
+    const end_marker = "-----END CERTIFICATE-----";
+    const base64 = std.base64.standard.decoderWithIgnore(" \t\r\n");
+    var start_index: usize = 0;
+    while (std.mem.indexOfPos(u8, pem, start_index, begin_marker)) |begin| {
+        const cert_start = begin + begin_marker.len;
+        const cert_end = std.mem.indexOfPos(u8, pem, cert_start, end_marker) orelse
+            return error.MissingEndCertificateMarker;
+        start_index = cert_end + end_marker.len;
+        const encoded = std.mem.trim(u8, pem[cert_start..cert_end], " \t\r\n");
+        const decoded_start = std.math.cast(u32, bundle.bytes.items.len) orelse
+            return error.CertificateAuthorityBundleTooBig;
+        try bundle.bytes.ensureUnusedCapacity(allocator, base64.calcSizeUpperBound(encoded.len));
+        bundle.bytes.items.len += try base64.decode(bundle.bytes.unusedCapacitySlice(), encoded);
+        try bundle.parseCert(allocator, decoded_start, now_sec);
+    }
+}
 
 /// Kept free past the head in a request's read buffer, which is sized
 /// `buffer_size + body_read_reserve`. `parseHeaders` gives the body reader
