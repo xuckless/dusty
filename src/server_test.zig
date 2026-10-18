@@ -3609,3 +3609,46 @@ test "Server: serves on an inherited listening socket (fd)" {
     const resp = try rawAll(io, &server, "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", &buf);
     try std.testing.expect(std.mem.endsWith(u8, resp, "inherited"));
 }
+
+test "Server: a response can carry more headers than a request may" {
+    const io = std.testing.io;
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .listeners = loopback,
+        .request = .{ .max_header_count = 4 },
+    }, {});
+    defer server.deinit();
+    server.router.get("/", struct {
+        fn handle(_: *dusty.Request, res: *dusty.Response) !void {
+            inline for (0..40) |i| try res.header(std.fmt.comptimePrint("X-Header-{d}", .{i}), "v");
+            res.body = "ok";
+        }
+    }.handle);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    var client_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void), _io: std.Io) !void {
+            try s.ready.wait(_io);
+            const stream = try s.address.ip.connect(_io, .{ .mode = .stream });
+            defer stream.close(_io);
+            var write_buf: [256]u8 = undefined;
+            var writer = stream.writer(_io, &write_buf);
+            try writer.interface.writeAll("GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            try writer.interface.flush();
+            var read_buf: [4096]u8 = undefined;
+            var reader = stream.reader(_io, &read_buf);
+            var out: [4096]u8 = undefined;
+            var w: std.Io.Writer = .fixed(&out);
+            _ = reader.interface.streamRemaining(&w) catch {};
+            const resp = w.buffered();
+            try std.testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 200"));
+            try std.testing.expect(std.mem.indexOf(u8, resp, "X-Header-39: v\r\n") != null);
+        }
+    }.run, .{ &server, io });
+    try client_future.await(io);
+}

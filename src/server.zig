@@ -1608,7 +1608,7 @@ pub fn Server(comptime Ctx: type) type {
 
                 log.debug("Received: {f} {s}", .{ request.method, request.url });
 
-                var response = try Response.init(request.arena, connection, self.config.request.max_header_count);
+                var response = try Response.init(request.arena, connection, self.config.response.max_header_count);
                 self.configureResponse(&response);
                 defer response.deinit();
                 response.head = request.method == .head;
