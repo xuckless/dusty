@@ -9,6 +9,9 @@ All notable changes to this project will be documented in this file.
 - Server and client connections now call `tls.Connection.deinit` on close
   when the TLS module declares one, so an injected module backed by a C
   library (one `SSL` object per connection) does not leak per connection.
+- Added `ServerConfig.Tls.alpn_protocols`, the protocols a TLS listener
+  offers through ALPN in preference order, and the server
+  `Connection.negotiatedProtocol()` that reports the agreed one.
 - `Listener.kernel_backlog` now defaults to the system's limit, `net.core.somaxconn`
   on Linux, instead of 1024. A full accept queue makes Linux drop new connections,
   which then wait a second or more to retry.
