@@ -63,6 +63,10 @@ pub const Request = struct {
     /// This request's ID, set by the RequestId middleware: for log lines,
     /// traces and error reports. Empty without it.
     id: []const u8 = "",
+    /// The W3C trace context of this request (hex trace and span IDs), set
+    /// by a tracing middleware; empty without one.
+    trace_id: []const u8 = "",
+    span_id: []const u8 = "",
 
     arena: std.mem.Allocator,
     io: std.Io = undefined,
