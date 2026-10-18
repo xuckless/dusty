@@ -1,6 +1,11 @@
 const std = @import("std");
 const Uri = std.Uri;
 const tls = @import("tls");
+/// A TLS module may load a CA bundle once into its own form
+/// (`tls.TrustStore`: `init(bundle)`, `deinit()`), taken by each handshake
+/// as `trust`, so none of them converts the bundle again. tls.zig has none.
+const has_trust_store = build_options.use_tls and @hasDecl(tls, "TrustStore");
+const TrustStore = if (has_trust_store) tls.TrustStore else void;
 const build_options = @import("build_options");
 
 const unix_path_max = 108;
@@ -229,6 +234,8 @@ pub const WebSocketClient = struct {
 /// outlives every connection it hands them to.
 const TlsRef = struct {
     ca_bundle: *std.crypto.Certificate.Bundle,
+    /// `ca_bundle` loaded once by the TLS module, when it offers that.
+    trust: ?*const TrustStore,
     /// Client certificate for mutual TLS, null when none is configured.
     client_cert: ?*tls.config.CertKeyPair,
     insecure_skip_verify: bool,
@@ -580,18 +587,20 @@ pub const Connection = struct {
             else
                 &.{};
 
+            var options: tls.config.Client = .{
+                .host = remote_host,
+                .root_ca = tls_cfg.ca_bundle.*,
+                .insecure_skip_verify = tls_cfg.insecure_skip_verify,
+                .auth = tls_cfg.client_cert,
+                .now = std.Io.Clock.real.now(self.io),
+                .rng = self.tls_rng.interface(),
+                .alpn_protocols = alpn_protocols,
+            };
+            if (comptime has_trust_store) options.trust = tls_cfg.trust;
             self.tls_conn = tls.client(
                 &self.tcp_reader.interface,
                 &self.tcp_writer.interface,
-                .{
-                    .host = remote_host,
-                    .root_ca = tls_cfg.ca_bundle.*,
-                    .insecure_skip_verify = tls_cfg.insecure_skip_verify,
-                    .auth = tls_cfg.client_cert,
-                    .now = std.Io.Clock.real.now(self.io),
-                    .rng = self.tls_rng.interface(),
-                    .alpn_protocols = alpn_protocols,
-                },
+                options,
             ) catch |err| {
                 // tls.zig only ever saw the ciphertext reader or writer fail
                 // generically, so for those the cause is a layer down.
@@ -959,6 +968,7 @@ pub const Client = struct {
     /// the first HTTPS request and reused afterwards.
     const TlsState = struct {
         ca_bundle: std.crypto.Certificate.Bundle = .empty,
+        trust: ?TrustStore = null,
         client_cert: ?tls.config.CertKeyPair = null,
     };
 
@@ -985,6 +995,7 @@ pub const Client = struct {
         }
         return .{
             .ca_bundle = &self.tls_state.ca_bundle,
+            .trust = if (self.tls_state.trust) |*t| t else null,
             .client_cert = if (self.tls_state.client_cert) |*pair| pair else null,
             .insecure_skip_verify = self.config.tls.insecure_skip_verify,
         };
@@ -999,6 +1010,11 @@ pub const Client = struct {
 
         var ca_bundle = try cfg.ca.load(self.allocator, self.io);
         errdefer ca_bundle.deinit(self.allocator);
+        var trust: ?TrustStore = null;
+        if (comptime has_trust_store) if (cfg.ca != .none) {
+            trust = try TrustStore.init(ca_bundle);
+        };
+        errdefer if (comptime has_trust_store) if (trust) |*t| t.deinit();
 
         var client_cert: ?tls.config.CertKeyPair = null;
         errdefer if (client_cert) |*pair| pair.deinit(self.allocator);
@@ -1012,12 +1028,13 @@ pub const Client = struct {
             );
         }
 
-        self.tls_state = .{ .ca_bundle = ca_bundle, .client_cert = client_cert };
+        self.tls_state = .{ .ca_bundle = ca_bundle, .trust = trust, .client_cert = client_cert };
     }
 
     pub fn deinit(self: *Client) void {
         self.pool.deinit();
         self.tls_state.ca_bundle.deinit(self.allocator);
+        if (comptime has_trust_store) if (self.tls_state.trust) |*t| t.deinit();
         if (self.tls_state.client_cert) |*pair| pair.deinit(self.allocator);
     }
 
