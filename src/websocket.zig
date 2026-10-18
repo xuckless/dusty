@@ -19,6 +19,13 @@ pub const WebSocket = struct {
     closed: bool = false,
     auto_responded: bool = false,
     fragmented_type: ?MessageType = null,
+    /// The message in pieces had RSV1 on its first frame.
+    fragmented_compressed: bool = false,
+    /// An extension that claims RSV1 (permessage-deflate, RFC 7692) was
+    /// negotiated: RSV1 on a message's first frame is passed on as
+    /// `Message.compressed` rather than refused. The extension itself is
+    /// the caller's.
+    rsv1_allowed: bool = false,
     fragmented_data: std.ArrayListUnmanaged(u8) = .empty,
     write_mutex: std.Io.Mutex = .init,
     /// When false, `send` and `ping` skip the flush after writing their
@@ -44,6 +51,9 @@ pub const WebSocket = struct {
         type: MessageType,
         data: []const u8,
         close_code: ?CloseCode = null,
+        /// RSV1 was set (only with `rsv1_allowed`): `data` is still
+        /// compressed, and a text message is not yet checked for UTF-8.
+        compressed: bool = false,
     };
 
     pub const CloseCode = enum(u16) {
@@ -190,8 +200,11 @@ pub const WebSocket = struct {
     fn readMessage(self: *WebSocket) !Message {
         self.fragmented_data = .empty;
         self.fragmented_type = null;
+        self.fragmented_compressed = false;
         while (true) {
             const frame = try self.readFrame();
+            // RSV1 marks a compressed message on its first frame only.
+            if (frame.rsv1 and (frame.opcode != .text and frame.opcode != .binary)) return Error.ReservedFlags;
 
             switch (frame.opcode) {
                 .ping => {
@@ -245,10 +258,11 @@ pub const WebSocket = struct {
                         const msg_type = self.fragmented_type.?;
                         const data = try self.fragmented_data.toOwnedSlice(self.msg_arena.allocator());
                         self.fragmented_type = null;
-                        if (msg_type == .text and !std.unicode.utf8ValidateSlice(data)) {
+                        const compressed = self.fragmented_compressed;
+                        if (!compressed and msg_type == .text and !std.unicode.utf8ValidateSlice(data)) {
                             return Error.InvalidUtf8;
                         }
-                        return .{ .type = msg_type, .data = data };
+                        return .{ .type = msg_type, .data = data, .compressed = compressed };
                     }
                 },
                 .text, .binary => {
@@ -259,16 +273,17 @@ pub const WebSocket = struct {
                     }
                     if (frame.fin) {
                         // Complete message in single frame
-                        if (frame.opcode == .text and !std.unicode.utf8ValidateSlice(frame.payload)) {
+                        if (!frame.rsv1 and frame.opcode == .text and !std.unicode.utf8ValidateSlice(frame.payload)) {
                             return Error.InvalidUtf8;
                         }
-                        return .{ .type = frame.opcode, .data = frame.payload };
+                        return .{ .type = frame.opcode, .data = frame.payload, .compressed = frame.rsv1 };
                     } else {
                         // Start of fragmented message
                         if (frame.payload.len > self.max_message_size) {
                             return Error.MessageTooLarge;
                         }
                         self.fragmented_type = frame.opcode;
+                        self.fragmented_compressed = frame.rsv1;
                         self.fragmented_data.clearRetainingCapacity();
                         try self.fragmented_data.appendSlice(self.msg_arena.allocator(), frame.payload);
                     }
@@ -282,6 +297,17 @@ pub const WebSocket = struct {
     pub fn send(self: *WebSocket, msg_type: MessageType, data: []const u8) !void {
         if (msg_type != .text and msg_type != .binary) return Error.InvalidOpcode;
         try self.writeFrame(msg_type, data, true, self.autoflush);
+    }
+
+    /// Sends `data`, already compressed by the negotiated extension, as one
+    /// message with RSV1 set. Needs `rsv1_allowed`.
+    pub fn sendCompressed(self: *WebSocket, msg_type: MessageType, data: []const u8) !void {
+        if (msg_type != .text and msg_type != .binary) return Error.InvalidOpcode;
+        if (!self.rsv1_allowed) return Error.ReservedFlags;
+        try self.write_mutex.lock(self.io);
+        defer self.write_mutex.unlock(self.io);
+        if (self.closed) return error.EndOfStream;
+        return self.resolveWrite(self.writeFrameRsv(msg_type, data, true, self.autoflush, 0x40));
     }
 
     /// Send a ping frame
@@ -309,6 +335,8 @@ pub const WebSocket = struct {
 
     const Frame = struct {
         fin: bool,
+        /// Only with `rsv1_allowed`; refused otherwise.
+        rsv1: bool = false,
         opcode: MessageType,
         payload: []const u8,
     };
@@ -319,10 +347,12 @@ pub const WebSocket = struct {
         try self.transport.reader.readSliceAll(&header);
 
         const fin = (header[0] & 0x80) != 0;
-        // RSV1, RSV2, RSV3 must be 0 (we don't support extensions)
-        if (header[0] & 0x70 != 0) {
+        // RSV2 and RSV3 must be 0, and RSV1 too unless an extension claimed it.
+        const allowed: u8 = if (self.rsv1_allowed) 0x40 else 0;
+        if (header[0] & 0x70 & ~allowed != 0) {
             return Error.ReservedFlags;
         }
+        const rsv1 = header[0] & 0x40 != 0;
         const opcode: MessageType = @enumFromInt(@as(u4, @truncate(header[0] & 0x0F)));
         const masked = (header[1] & 0x80) != 0;
 
@@ -378,6 +408,7 @@ pub const WebSocket = struct {
 
         return .{
             .fin = fin,
+            .rsv1 = rsv1,
             .opcode = opcode,
             .payload = payload,
         };
@@ -399,12 +430,16 @@ pub const WebSocket = struct {
     }
 
     fn writeFrameLocked(self: *WebSocket, opcode: MessageType, data: []const u8, fin: bool, flush_now: bool) std.Io.Writer.Error!void {
+        return self.writeFrameRsv(opcode, data, fin, flush_now, 0);
+    }
+
+    fn writeFrameRsv(self: *WebSocket, opcode: MessageType, data: []const u8, fin: bool, flush_now: bool, rsv: u8) std.Io.Writer.Error!void {
         // A half-written frame leaves the peer unable to find the next frame
         // boundary.
         errdefer self.closed = true;
 
-        // First byte: FIN + opcode
-        const byte0: u8 = (@as(u8, if (fin) 0x80 else 0x00)) | @intFromEnum(opcode);
+        // First byte: FIN + RSV + opcode
+        const byte0: u8 = (@as(u8, if (fin) 0x80 else 0x00)) | rsv | @intFromEnum(opcode);
         try self.transport.writer.writeByte(byte0);
 
         // Second byte: mask bit + payload length
@@ -1026,4 +1061,28 @@ test "WebSocket: no std.Io sentinel escapes its public API" {
             try std.testing.expect(!std.mem.eql(u8, e_name, "ReadFailed"));
         }
     }
+}
+
+test "WebSocket: RSV1 is passed on as compressed once allowed, and only on a data message's first frame" {
+    // A masked text frame with RSV1 (0xC1), then a ping with RSV1 (0xC9).
+    const frames = [_]u8{ 0xC1, 0x82, 0, 0, 0, 0, 'h', 'i', 0xC9, 0x80, 0, 0, 0, 0 };
+    var reader: std.Io.Reader = .fixed(&frames);
+    var out: [64]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&out);
+    var ws = WebSocket.init(std.testing.io, .{ .reader = &reader, .writer = &writer }, std.testing.allocator, 1);
+    defer ws.deinit();
+
+    // Not negotiated: refused.
+    try std.testing.expectError(WebSocket.Error.ReservedFlags, ws.receive());
+
+    reader = .fixed(&frames);
+    ws.rsv1_allowed = true;
+    const msg = try ws.receive();
+    try std.testing.expect(msg.compressed);
+    try std.testing.expectEqualStrings("hi", msg.data);
+    // RSV1 on a control frame is still an error.
+    try std.testing.expectError(WebSocket.Error.ReservedFlags, ws.receive());
+
+    try ws.sendCompressed(.text, "x");
+    try std.testing.expectEqual(@as(u8, 0xC1), out[0]);
 }
