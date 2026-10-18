@@ -178,6 +178,7 @@ pub fn clientError(err: anyerror) ?struct { status: http.Status, body: []const u
     return switch (err) {
         error.BodyTooBig => .{ .status = .payload_too_large, .body = "413 Content Too Large\n" },
         error.UnsupportedContentEncoding => .{ .status = .unsupported_media_type, .body = "415 Unsupported Media Type\n" },
+        error.InvalidZstd, error.IncompleteBody => .{ .status = .bad_request, .body = "400 Bad Request\n" },
         error.SyntaxError,
         error.UnexpectedEndOfInput,
         error.UnexpectedToken,

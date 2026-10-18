@@ -3,6 +3,7 @@ const Transport = @import("transport.zig").Transport;
 
 const c = @import("llhttp");
 const zlib = @import("zlib");
+const zstd_io = if (build_options.use_zstd) @import("zstd_io.zig") else struct {};
 const build_options = @import("build_options");
 
 const Method = @import("http.zig").Method;
@@ -615,10 +616,19 @@ pub fn BodyReader(comptime Parser: type) type {
             }
         }
 
+        /// `decodeCause` for zstd: a frame cut short is an incomplete body.
+        fn zstdCause(e: anyerror) error{ IncompleteBody, InvalidZstd, OutOfMemory } {
+            return switch (e) {
+                error.TruncatedInput => error.IncompleteBody,
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.InvalidZstd,
+            };
+        }
+
         /// What reading a body can fail with, once the sentinel is resolved.
         pub const Error = Transport.ReadError || Transport.WriteError ||
             ParseError || @typeInfo(@TypeOf(decodeCause(undefined))).error_union.error_set ||
-            error{ IncompleteBody, Unexpected };
+            error{ IncompleteBody, InvalidZstd, Unexpected };
 
         /// Stores what actually went wrong and reports the sentinel the
         /// vtable requires. Mirrors `fail` on the buffered body writer.
@@ -647,7 +657,12 @@ pub fn BodyReader(comptime Parser: type) type {
         pub const Decode = struct {
             source: Self,
             source_buffer: [source_buffer_len]u8,
-            decoder: zlib.Decompress,
+            decoder: Decoder,
+
+            const Decoder = union(enum) {
+                zlib: zlib.Decompress,
+                zstd: if (build_options.use_zstd) zstd_io.Decompress else void,
+            };
 
             /// What the decoder pulls raw framed bytes in. It takes all of
             /// it at once, so this is about how often that goes back through
@@ -678,13 +693,19 @@ pub fn BodyReader(comptime Parser: type) type {
             allocator: std.mem.Allocator,
             encoding: ContentEncoding,
         ) StartDecodingError!void {
-            // Built without zlib, nothing here can undo a coding.
-            if (!build_options.use_zlib and encoding != .identity) return error.UnsupportedContentEncoding;
+            if (encoding == .identity) return;
+            if (encoding == .zstd) {
+                if (!build_options.use_zstd) return error.UnsupportedContentEncoding;
+            } else if (!build_options.use_zlib) {
+                // Built without zlib, nothing here can undo gzip or deflate.
+                return error.UnsupportedContentEncoding;
+            }
             const container: zlib.Container = switch (encoding) {
-                .identity => return,
+                .identity => unreachable,
                 .gzip => .gzip,
                 // HTTP's "deflate" is zlib-wrapped, whatever the name says.
                 .deflate => .zlib,
+                .zstd => .raw, // unused
                 .unknown => return error.UnsupportedContentEncoding,
             };
             // Stated above, checked here. A reader that has been read from
@@ -699,7 +720,17 @@ pub fn BodyReader(comptime Parser: type) type {
             decode.source.interface.buffer = &decode.source_buffer;
             // No buffer of its own: it is only ever read through `stream`,
             // which writes into the caller's writer.
-            decode.decoder = try .init(allocator, &decode.source.interface, &.{}, container, .{});
+            if (encoding == .zstd) {
+                if (!build_options.use_zstd) unreachable;
+                decode.decoder = .{ .zstd = undefined };
+                // RFC 9659: HTTP's zstd window is at most 8 MiB.
+                decode.decoder.zstd.init(allocator, &decode.source.interface, &.{}, 23) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return error.UnsupportedContentEncoding,
+                };
+            } else {
+                decode.decoder = .{ .zlib = try .init(allocator, &decode.source.interface, &.{}, container, .{}) };
+            }
             self.decode = decode;
         }
 
@@ -712,15 +743,26 @@ pub fn BodyReader(comptime Parser: type) type {
             w: *std.Io.Writer,
             limit: std.Io.Limit,
         ) std.Io.Reader.StreamError!usize {
-            return decode.decoder.reader.stream(w, limit) catch |err| switch (err) {
-                error.ReadFailed => {
-                    if (decode.decoder.err) |e| {
-                        if (decodeCause(e)) |_| {} else |cause| return self.fail(cause);
-                    }
-                    return self.fail(decode.source.err orelse error.Unexpected);
+            switch (decode.decoder) {
+                .zlib => |*d| return d.reader.stream(w, limit) catch |err| switch (err) {
+                    error.ReadFailed => {
+                        if (d.err) |e| {
+                            if (decodeCause(e)) |_| {} else |cause| return self.fail(cause);
+                        }
+                        return self.fail(decode.source.err orelse error.Unexpected);
+                    },
+                    else => |e| return e,
                 },
-                else => |e| return e,
-            };
+                .zstd => |*d| if (build_options.use_zstd) {
+                    return d.reader.stream(w, limit) catch |err| switch (err) {
+                        error.ReadFailed => {
+                            if (d.err) |e| return self.fail(zstdCause(e));
+                            return self.fail(decode.source.err orelse error.Unexpected);
+                        },
+                        else => |e| return e,
+                    };
+                } else unreachable,
+            }
         }
 
         fn stream(io_r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {

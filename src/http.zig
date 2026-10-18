@@ -877,12 +877,14 @@ pub const ContentEncoding = enum {
     identity,
     gzip,
     deflate,
+    zstd,
     unknown,
 
     pub fn fromString(value: []const u8) ContentEncoding {
         if (std.ascii.eqlIgnoreCase(value, "gzip")) return .gzip;
         if (std.ascii.eqlIgnoreCase(value, "x-gzip")) return .gzip;
         if (std.ascii.eqlIgnoreCase(value, "deflate")) return .deflate;
+        if (std.ascii.eqlIgnoreCase(value, "zstd")) return .zstd;
         if (std.ascii.eqlIgnoreCase(value, "identity")) return .identity;
         return .unknown;
     }
@@ -965,7 +967,7 @@ test "ContentEncoding: fromString" {
     try std.testing.expectEqual(ContentEncoding.gzip, ContentEncoding.fromString("GZIP"));
     try std.testing.expectEqual(ContentEncoding.deflate, ContentEncoding.fromString("deflate"));
     try std.testing.expectEqual(ContentEncoding.unknown, ContentEncoding.fromString("br"));
-    try std.testing.expectEqual(ContentEncoding.unknown, ContentEncoding.fromString("zstd"));
+    try std.testing.expectEqual(ContentEncoding.zstd, ContentEncoding.fromString("zstd"));
 }
 
 test "Headers: remove" {

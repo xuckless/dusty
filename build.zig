@@ -20,6 +20,11 @@ pub fn build(b: *std.Build) void {
         "Compile Dusty's vendored nghttp2; disable to inject a compatible 'nghttp2' module",
     ) orelse true;
     const use_zlib = b.option(bool, "use_zlib", "Build with gzip/deflate support via zlib.zig") orelse true;
+    const use_zstd = b.option(
+        bool,
+        "use_zstd",
+        "Content-Encoding: zstd for responses and request bodies; needs an injected 'zstd' module (zstd.h bindings with ZSTD_STATIC_LINKING_ONLY)",
+    ) orelse false;
     const use_bundled_zlib = b.option(
         bool,
         "use_bundled_zlib",
@@ -36,6 +41,7 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "use_tls", use_tls);
     build_options.addOption(bool, "use_http2", use_http2);
     build_options.addOption(bool, "use_zlib", use_zlib);
+    build_options.addOption(bool, "use_zstd", use_zstd);
     mod.addOptions("build_options", build_options);
 
     // Default `zio` import — a marker stub that selects the portable std.Io
@@ -71,6 +77,14 @@ pub fn build(b: *std.Build) void {
     // lazy dependency, like TLS: only fetched when `use_zlib` is set (the
     // default). When disabled, a stub is imported so everything still builds,
     // and a coded body is refused with error.UnsupportedContentEncoding.
+    // zstd has no bundled copy: an application that wants it injects its
+    // bindings, dusty_mod.addImport("zstd", its_module).
+    if (use_zstd) {
+        mod.addAnonymousImport("zstd", .{
+            .root_source_file = b.path("src/zstd_injection_required.zig"),
+        });
+    }
+
     if (use_zlib and !use_bundled_zlib) {
         // An application that builds its own zlib (zlib-ng, say) injects a
         // module with zlib.zig's API: dusty_mod.addImport("zlib", its_module).

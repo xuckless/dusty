@@ -3151,3 +3151,26 @@ test "Server: a head that does not arrive within read_header closes the connecti
         try std.testing.expect(std.mem.endsWith(u8, fw.buffered(), "late"));
     }
 }
+
+test "Server: a zstd request body is refused with 415 when built without zstd" {
+    if (@import("build_options").use_zstd) return error.SkipZigTest;
+    const io = std.testing.io;
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
+    defer server.deinit();
+    server.router.post("/body", struct {
+        fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+            res.body = (try req.body()) orelse "";
+        }
+    }.handle);
+    var future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer future.cancel(io) catch {};
+    try server.ready.wait(io);
+
+    var buf: [1024]u8 = undefined;
+    const head = try rawHead(io, &server, "POST /body HTTP/1.1\r\nHost: x\r\nContent-Encoding: zstd\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabc", &buf);
+    try std.testing.expect(std.mem.startsWith(u8, head, "HTTP/1.1 415 Unsupported Media Type\r\n"));
+}
