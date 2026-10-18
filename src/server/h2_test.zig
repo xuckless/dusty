@@ -56,9 +56,19 @@ const TestClient = struct {
 
     /// Over TLS, offering only "h2" through ALPN.
     fn initTls(self: *TestClient, gpa: std.mem.Allocator, io: std.Io, addr: std.Io.net.IpAddress, ca: *std.crypto.Certificate.Bundle) !void {
+        return self.initTlsAfter(gpa, io, addr, ca, "");
+    }
+
+    /// `initTls`, with `preamble` (a PROXY protocol header) sent in the
+    /// clear before the handshake.
+    fn initTlsAfter(self: *TestClient, gpa: std.mem.Allocator, io: std.Io, addr: std.Io.net.IpAddress, ca: *std.crypto.Certificate.Bundle, preamble: []const u8) !void {
         self.* = .{ .gpa = gpa, .io = io, .stream = try addr.connect(io, .{ .mode = .stream }) };
         self.reader = self.stream.reader(io, &self.read_buf);
         self.writer = self.stream.writer(io, &self.write_buf);
+        if (preamble.len > 0) {
+            try self.writer.interface.writeAll(preamble);
+            try self.writer.interface.flush();
+        }
         var rng: std.Random.IoSource = .{ .io = io };
         self.tls_conn = try tls.client(&self.reader.interface, &self.writer.interface, .{
             .host = "localhost",
@@ -252,6 +262,9 @@ const Handlers = struct {
     }
     fn ignoreBody(_: *dusty.Request, res: *dusty.Response) !void {
         res.body = "not reading that";
+    }
+    fn who(req: *dusty.Request, res: *dusty.Response) !void {
+        try res.print(.text, "{f} secure={}", .{ req.remote_address, req.secure });
     }
     fn slow(req: *dusty.Request, res: *dusty.Response) !void {
         try req.io.sleep(.fromMilliseconds(300), .awake);
@@ -582,4 +595,34 @@ test "HTTP/2: a drain with a stream in flight sends a two-phase GOAWAY and finis
     const resp = client.get(id);
     try std.testing.expectEqual(@as(u16, 200), resp.status);
     try std.testing.expectEqualStrings("slow but whole", resp.body.items);
+}
+
+test "HTTP/2: a PROXY protocol header ahead of TLS names the client of an h2 stream" {
+    if (!build_options.use_tls) return error.SkipZigTest;
+    const io = std.testing.io;
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .listeners = &.{.{ .address = loopback_addr, .proxy_protocol = true, .tls = .{
+            .cert_path = "examples/certs/cert.pem",
+            .key_path = "examples/certs/key.pem",
+            .alpn_protocols = &.{ "h2", "http/1.1" },
+        } }},
+    }, {});
+    defer server.deinit();
+    server.router.get("/who", Handlers.who);
+    var future = try io.concurrent(Fixture.run, .{&server});
+    defer future.cancel(io) catch {};
+    try server.ready.wait(io);
+
+    const ca: dusty.TlsCa = .{ .file = .{ .path = "examples/certs/cert.pem" } };
+    var bundle = try ca.load(std.testing.allocator, io);
+    defer bundle.deinit(std.testing.allocator);
+
+    // The header is read to its last byte and no further: the ClientHello
+    // right behind it still reaches the handshake whole.
+    var client: TestClient = undefined;
+    try client.initTlsAfter(std.testing.allocator, io, server.address.ip, &bundle, "PROXY TCP4 192.0.2.44 198.51.100.2 40000 443\r\n");
+    defer client.deinit();
+    const id = try client.request("GET", "/who", null);
+    try client.run();
+    try std.testing.expectEqualStrings("192.0.2.44:40000 secure=true", client.get(id).body.items);
 }
