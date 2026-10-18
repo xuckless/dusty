@@ -3451,3 +3451,77 @@ test "Server: compression follows the client's q-values over the server's prefer
     const none = try rawHead(io, &server, "GET /text HTTP/1.1\r\nHost: x\r\nAccept-Encoding: gzip;q=0, *;q=0\r\nConnection: close\r\n\r\n", &buf2);
     try std.testing.expect(std.mem.indexOf(u8, none, "Content-Encoding") == null);
 }
+
+/// Counts allocations through it, for the hot-path test below.
+const CountingAllocator = struct {
+    inner: std.mem.Allocator,
+    count: std.atomic.Value(usize) = .init(0),
+
+    fn allocator(self: *CountingAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        _ = self.count.fetchAdd(1, .monotonic);
+        return self.inner.rawAlloc(len, alignment, ra);
+    }
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        return self.inner.rawResize(memory, alignment, new_len, ra);
+    }
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        _ = self.count.fetchAdd(1, .monotonic);
+        return self.inner.rawRemap(memory, alignment, new_len, ra);
+    }
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        self.inner.rawFree(memory, alignment, ra);
+    }
+};
+
+test "Server: a warm HTTP/1.1 keepalive connection serves requests without allocating" {
+    const io = std.testing.io;
+    var counting: CountingAllocator = .{ .inner = std.testing.allocator };
+    var server = dusty.Server(void).init(counting.allocator(), io, .{ .listeners = loopback }, {});
+    defer server.deinit();
+    var request_id = dusty.middleware.RequestId.init(.{});
+    server.router.use(dusty.Middleware(void).init(&request_id));
+    server.router.get("/users/:id", struct {
+        fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+            try res.print(.text, "user {s}", .{req.params.get("id").?});
+        }
+    }.handle);
+    var future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer future.cancel(io) catch {};
+    try server.ready.wait(io);
+
+    const stream = try server.address.ip.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    var wbuf: [256]u8 = undefined;
+    var w = stream.writer(io, &wbuf);
+    var rbuf: [2048]u8 = undefined;
+    var r = stream.reader(io, &rbuf);
+    var status: [64]u8 = undefined;
+    var body: [64]u8 = undefined;
+    const request = "GET /users/2 HTTP/1.1\r\nHost: x\r\nUser-Agent: test\r\nAccept: */*\r\n\r\n";
+
+    // Warm up: the request buffers, arena and maps grow to what a request
+    // needs.
+    for (0..5) |_| {
+        try w.interface.writeAll(request);
+        try w.interface.flush();
+        _ = try readResponse(&r.interface, &status, &body);
+    }
+    const before = counting.count.load(.monotonic);
+    for (0..20) |_| {
+        try w.interface.writeAll(request);
+        try w.interface.flush();
+        try std.testing.expectEqualStrings("user 2", (try readResponse(&r.interface, &status, &body)).body);
+    }
+    try std.testing.expectEqual(before, counting.count.load(.monotonic));
+}
