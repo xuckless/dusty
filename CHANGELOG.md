@@ -23,7 +23,9 @@ All notable changes to this project will be documented in this file.
   server's own 404, 405 and error answers go the same way.
 - Added `ServerConfig.error_handler`, a plain function that answers handler
   errors for a server without a context, and `defaultError(req, res, err)`,
-  the default answer, for it or an `uncaughtError` to fall back on.
+  the default answer, for it or an `uncaughtError` to fall back on. A
+  handler error is logged by the status it was answered with, whoever chose
+  it: at debug for a 4xx, at err for a 5xx.
 - Added `Request.bind(T)`: the JSON body as a `T`, unknown fields ignored,
   `MissingBody` without one and `InvalidJsonBody` when it does not fit.
   `bindWith(T, options)` takes `std.json`'s options. **Breaking:**

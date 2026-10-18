@@ -110,14 +110,15 @@ pub fn Executor(comptime Ctx: type) type {
                         log.err("unhandled error after response headers were sent: {} ({f} {s})", .{ err, self.req.method, self.req.url });
                         return err;
                     }
-                    const status = errorStatus(err);
-                    if (status != null and @backingInt(status.?) < 500) {
-                        // The request's fault, answered with a 4xx below.
+                    self.handleError(err);
+                    // By what it was answered with, which an `uncaughtError`
+                    // or `error_handler` may have chosen: a 4xx is the
+                    // request's fault, a 5xx the server's.
+                    if (@backingInt(self.res.status) < 500) {
                         log.debug("request rejected: {} ({f} {s})", .{ err, self.req.method, self.req.url });
                     } else {
                         log.err("unhandled error in request handler: {} ({f} {s})", .{ err, self.req.method, self.req.url });
                     }
-                    self.handleError(err);
                 },
             };
         }
