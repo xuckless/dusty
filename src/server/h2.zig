@@ -597,12 +597,22 @@ pub fn Engine(comptime Ctx: type) type {
                 conn.lock();
                 const finished = c.nghttp2_session_want_read(conn.session) == 0 and
                     c.nghttp2_session_want_write(conn.session) == 0;
+                // With the reader gone (the peer closed, or only half-closed
+                // its side), a handler still running may yet have a response
+                // to send: stay for it rather than drop it.
+                var handlers_running = false;
+                if (closing) {
+                    var it = conn.streams.valueIterator();
+                    while (it.next()) |stream| {
+                        if (!stream.*.handler_done) handlers_running = true;
+                    }
+                }
                 conn.unlock();
                 if (finished) {
                     conn.connection.stream.shutdown(conn.io, .both) catch {};
                     return;
                 }
-                if (closing) return;
+                if (closing and !handlers_running) return;
                 try conn.io.futexWait(u32, &conn.write_gen.raw, gen);
             }
         }
@@ -1216,6 +1226,17 @@ pub fn Engine(comptime Ctx: type) type {
         /// Under the mutex.
         fn startDiscard(conn: *Conn, stream: *Stream) void {
             if (stream.discarding) return;
+            // A tunnel (RFC 8441) whose handler is done has nothing left to
+            // read: end it now rather than wait for a peer that may keep its
+            // side open, and the stream (and a drain) with it.
+            if (stream.connect_protocol.len > 0) {
+                if (stream.reset) return;
+                stream.reset = true;
+                _ = c.nghttp2_submit_rst_stream(conn.session, c.NGHTTP2_FLAG_NONE, stream.id, c.NGHTTP2_NO_ERROR);
+                stream.closeBody();
+                conn.kickWriter();
+                return;
+            }
             stream.discarding = true;
             stream.discard_left = conn.config.stream_window;
             // What is queued was never credited back: credit it now.
