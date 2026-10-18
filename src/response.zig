@@ -8,6 +8,7 @@ const Connection = @import("server.zig").Connection;
 pub const Sink = @import("sink.zig").Sink;
 const zlib = @import("zlib");
 const build_options = @import("build_options");
+const zstd_io = if (build_options.use_zstd) @import("zstd_io.zig") else struct {};
 
 var no_buf: [0]u8 = .{};
 
@@ -518,16 +519,28 @@ pub const StreamingBodyWriter = struct {
     }
 };
 
-/// Gzips a streamed body between the handler and the framing: what the
-/// handler writes goes into `gzip`, and what that produces collects in
-/// `out` until there is a chunk's worth. Allocated from the arena, since
-/// `gzip` writes into `out` by pointer and the body writer holding this is
-/// returned by value.
+/// Compresses a streamed body (gzip or zstd) between the handler and the
+/// framing: what the handler writes goes into the coder, and what that
+/// produces collects in `out` until there is a chunk's worth. Allocated from
+/// the arena, since the coder writes into `out` by pointer and the body
+/// writer holding this is returned by value.
 const StreamCompressor = struct {
     res: *Response,
-    gzip: zlib.Compress,
+    coder: Coder,
     out: std.Io.Writer,
     out_buffer: [out_buffer_len]u8,
+
+    const Coder = union(enum) {
+        gzip: zlib.Compress,
+        zstd: if (build_options.use_zstd) zstd_io.Compress else void,
+    };
+
+    fn input(self: *StreamCompressor) *std.Io.Writer {
+        return switch (self.coder) {
+            .gzip => |*g| &g.writer,
+            .zstd => |*z| if (build_options.use_zstd) &z.writer else unreachable,
+        };
+    }
 
     const out_buffer_len = 4096;
 
@@ -539,31 +552,41 @@ const StreamCompressor = struct {
         .mem_level = 6,
     };
 
-    fn create(res: *Response) std.mem.Allocator.Error!*StreamCompressor {
+    fn create(res: *Response, coding: Response.Compression) error{ OutOfMemory, CompressFailed }!*StreamCompressor {
         const self = try res.arena.create(StreamCompressor);
         self.res = res;
         self.out = .{ .buffer = &self.out_buffer, .vtable = &.{ .drain = drainOut } };
         // Unbuffered: the body writer's buffer is in front of it already.
-        self.gzip = try .init(res.arena, &self.out, &.{}, .gzip, options);
+        switch (coding) {
+            .zstd => if (build_options.use_zstd) {
+                self.coder = .{ .zstd = undefined };
+                try self.coder.zstd.init(res.arena, &self.out, &.{}, .{});
+            } else unreachable,
+            else => self.coder = .{ .gzip = try .init(res.arena, &self.out, &.{}, .gzip, options) },
+        }
         return self;
     }
 
     fn write(self: *StreamCompressor, pending: []const u8, data: []const []const u8, splat: usize) std.Io.Writer.Error!void {
-        const w = &self.gzip.writer;
+        const w = self.input();
         try w.writeAll(pending);
         for (data[0 .. data.len - 1]) |bytes| try w.writeAll(bytes);
         try w.splatBytesAll(data[data.len - 1], splat);
     }
 
     fn flush(self: *StreamCompressor, pending: []const u8) std.Io.Writer.Error!void {
-        try self.gzip.writer.writeAll(pending);
-        try self.gzip.writer.flush();
+        const w = self.input();
+        try w.writeAll(pending);
+        try w.flush();
         try self.out.flush();
     }
 
     fn finish(self: *StreamCompressor, pending: []const u8) std.Io.Writer.Error!void {
-        try self.gzip.writer.writeAll(pending);
-        try self.gzip.finish();
+        try self.input().writeAll(pending);
+        switch (self.coder) {
+            .gzip => |*g| try g.finish(),
+            .zstd => |*z| if (build_options.use_zstd) try z.finish() else unreachable,
+        }
         try self.out.flush();
     }
 
@@ -828,8 +851,8 @@ pub const Response = struct {
         var compression = self.negotiateCompression();
         // Without the memory for a compressor the body goes out as it is,
         // as a buffered one does.
-        const compressor: ?*StreamCompressor = if (compression == .gzip and self.sendsBody())
-            StreamCompressor.create(self) catch blk: {
+        const compressor: ?*StreamCompressor = if (compression.isCoding() and self.sendsBody())
+            StreamCompressor.create(self, compression) catch blk: {
                 compression = .identity;
                 break :blk null;
             }
@@ -838,7 +861,7 @@ pub const Response = struct {
         self.headers_written = true;
 
         if (compression != .off) self.addVary();
-        if (compression == .gzip) self.markCompressed();
+        if (compression.isCoding()) self.markCompressed(compression);
         if (declared) |len| {
             self.content_length = len;
         } else if (self.sink != null) {
@@ -1160,10 +1183,19 @@ pub const Response = struct {
     const Compression = enum {
         /// Not asked for, or not for this response.
         off,
-        /// Applies, but this client does not take gzip. The response still
-        /// varies by `Accept-Encoding`.
+        /// Applies, but this client takes no coding we have. The response
+        /// still varies by `Accept-Encoding`.
         identity,
         gzip,
+        zstd,
+
+        fn isCoding(c: Compression) bool {
+            return c == .gzip or c == .zstd;
+        }
+
+        fn name(c: Compression) []const u8 {
+            return @tagName(c);
+        }
     };
 
     /// Whether compression applies to this response at all, and if so,
@@ -1173,7 +1205,7 @@ pub const Response = struct {
     /// `markCompressed`, which have their room reserved here, so that
     /// nothing fails after a response has started claiming a coding.
     fn negotiateCompression(self: *const Response) Compression {
-        if (!build_options.use_zlib or !self.compress) return .off;
+        if (!(build_options.use_zlib or build_options.use_zstd) or !self.compress) return .off;
         if (self.file != null) return .off;
         const not_modified = self.status == .not_modified;
         if (!not_modified and !statusHasBody(self.status)) return .off;
@@ -1191,7 +1223,10 @@ pub const Response = struct {
         if (self.headers.keys.len - self.headers.len < needed) return .off;
 
         const request = self.request orelse return .identity;
-        return if (http.acceptsGzip(&request.headers)) .gzip else .identity;
+        // Server preference: zstd compresses better and faster than gzip.
+        if (build_options.use_zstd and http.acceptsEncoding(&request.headers, "zstd")) return .zstd;
+        if (build_options.use_zlib and http.acceptsGzip(&request.headers)) return .gzip;
+        return .identity;
     }
 
     /// `Vary: *` included, which says the response varies by anything.
@@ -1222,7 +1257,7 @@ pub const Response = struct {
     /// A 304 gets the validators of the gzipped 200 it stands in for, but
     /// no `Content-Encoding`: RFC 9110 §15.4.5 leaves representation
     /// metadata off it.
-    fn markCompressed(self: *Response) void {
+    fn markCompressed(self: *Response, coding: Compression) void {
         _ = self.headers.remove("Accept-Ranges");
         if (self.headers.get("ETag")) |etag| {
             if (!std.mem.startsWith(u8, etag, "W/")) {
@@ -1234,19 +1269,35 @@ pub const Response = struct {
             }
         }
         if (self.status == .not_modified) return;
-        self.headers.add("Content-Encoding", "gzip") catch unreachable; // reserved
+        self.headers.add("Content-Encoding", coding.name()) catch unreachable; // reserved
     }
 
     /// Replaces the buffered body with its gzipped form, unless it is short
     /// or would not shrink. A failure to allocate sends the body as it was.
-    fn compressBody(self: *Response) void {
+    fn compressBody(self: *Response, coding: Compression) void {
         const len = self.bodyLen();
         if (len < min_compress_len) return;
-        const compressed = self.deflateBody(len) catch return;
+        const compressed = switch (coding) {
+            .zstd => if (build_options.use_zstd) self.zstdBody(len) catch return else unreachable,
+            else => self.deflateBody(len) catch return,
+        };
         if (compressed.len() >= len) return;
         self.body_buffer = compressed;
         self.body = "";
-        self.markCompressed();
+        self.markCompressed(coding);
+    }
+
+    /// The buffered body as one zstd frame. The window shrinks to the body
+    /// on its own, since the length is known.
+    fn zstdBody(self: *Response, len: usize) (std.mem.Allocator.Error || std.Io.Writer.Error || error{CompressFailed})!BodyBuffer {
+        var compressed: BodyBuffer = try .init(self.arena);
+        var out: BodyWriter = .into(self, &compressed);
+        var z: zstd_io.Compress = undefined;
+        try z.init(self.arena, &out.interface, &.{}, .{ .window_log = null, .pledged_size = len });
+        if (self.body_buffer.len() > 0) try self.body_buffer.writeTo(&z.writer) else try z.writer.writeAll(self.body);
+        try z.finish();
+        try out.interface.flush();
+        return compressed;
     }
 
     fn deflateBody(self: *Response, len: usize) (std.mem.Allocator.Error || std.Io.Writer.Error)!BodyBuffer {
@@ -1410,8 +1461,8 @@ pub const Response = struct {
             }
             const compression = self.negotiateCompression();
             if (compression != .off) self.addVary();
-            if (compression == .gzip) {
-                if (self.status == .not_modified) self.markCompressed() else self.compressBody();
+            if (compression.isCoding()) {
+                if (self.status == .not_modified) self.markCompressed(compression) else self.compressBody(compression);
             }
             self.headers_written = true;
         }
