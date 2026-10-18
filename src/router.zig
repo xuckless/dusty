@@ -15,7 +15,8 @@ pub const RouteInfo = struct {
     /// `/users/:id`, not the path that matched it.
     path: []const u8,
     /// Whatever the route was registered with, for its handler to cast
-    /// back. Null for the routes `get`, `post` and the like register.
+    /// back (`Router.addRoute`). Null for the routes `get`, `post` and the
+    /// like register.
     data: ?*const anyopaque = null,
 };
 
@@ -429,6 +430,15 @@ pub fn Router(comptime Ctx: type) type {
 
         pub fn query(self: *Self, path: []const u8, handler: Handler) void {
             self.insertRoute(path, .query, handler, self.middlewares, null) catch @panic("OOM");
+        }
+
+        /// Registers `handler` for `method` (null: every method, as `any`)
+        /// together with `data`, which the handler reads back as
+        /// `req.route.?.data`: per-route state for handlers that are the
+        /// same function for several routes or registrations. `data` must
+        /// outlive the router.
+        pub fn addRoute(self: *Self, method: ?Method, path: []const u8, handler: Handler, data: ?*const anyopaque) void {
+            self.insertRoute(path, method, handler, self.middlewares, data) catch @panic("OOM");
         }
 
         /// Matches every method, for requests that no route of their own
@@ -879,6 +889,36 @@ test "Router: the matched route is on the request, by its pattern" {
     req.url = "/nowhere";
     _ = try router.findHandler(&req);
     try std.testing.expectEqual(null, req.route);
+}
+
+test "Router: addRoute hands its data to the request" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var router = TestRouter.init(std.testing.allocator);
+    defer router.deinit();
+
+    const first: u32 = 1;
+    const second: u32 = 2;
+    router.addRoute(.post, "/one", testHandler, &first);
+    router.addRoute(.post, "/two", testHandler, &second);
+    router.post("/plain", testHandler);
+
+    var req = Request{
+        .method = .post,
+        .url = "/two",
+        .arena = arena.allocator(),
+        .parser = undefined,
+        .transport = undefined,
+    };
+    _ = try router.findHandler(&req);
+    try std.testing.expectEqual(@as(u32, 2), @as(*const u32, @ptrCast(@alignCast(req.route.?.data.?))).*);
+    req.url = "/one";
+    _ = try router.findHandler(&req);
+    try std.testing.expectEqual(@as(u32, 1), @as(*const u32, @ptrCast(@alignCast(req.route.?.data.?))).*);
+    req.url = "/plain";
+    _ = try router.findHandler(&req);
+    try std.testing.expectEqual(null, req.route.?.data);
 }
 
 test "Router: extract multiple parameters" {
