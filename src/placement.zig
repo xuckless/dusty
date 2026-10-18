@@ -7,12 +7,16 @@
 //! connection and everything it spawns stay on the executor that accepted it:
 //! nothing of one connection crosses threads, and its locks are uncontended.
 //!
-//! Elsewhere -- dusty's zio stub, `std.Io.Threaded`, or zio's work-stealing
-//! scheduling, where pinning a task is invalid -- this is plain `concurrent`.
+//! Elsewhere -- dusty's zio stub, a zio without placement, `std.Io.Threaded`,
+//! or zio's work-stealing scheduling, where pinning a task is invalid -- this
+//! is plain `concurrent`.
 const std = @import("std");
 const zio = @import("zio");
 
-const have_zio = !@hasDecl(zio, "is_stub");
+/// A zio with the placement API (it arrived after 0.18).
+const have_zio = !@hasDecl(zio, "is_stub") and @hasDecl(zio, "Placement") and
+    @hasDecl(zio, "Runtime") and @hasDecl(zio.Runtime, "fromIo") and
+    @hasDecl(zio, "Group") and @hasDecl(zio.Group, "spawnInto");
 
 pub const Where = union(enum) {
     /// The executor of the calling task.
