@@ -387,6 +387,16 @@ pub const Connection = struct {
         return if (self.tls_conn) |c| c.alpn_protocol else null;
     }
 
+    /// The client's certificate (the leaf, DER) on a TLS connection whose
+    /// handshake verified one, when the TLS module exposes it
+    /// (`tls.Connection.peerCertificate`); null otherwise. Owned by the TLS
+    /// connection, so valid until `deinit`.
+    pub fn peerCertificate(self: *const Connection) ?[]const u8 {
+        if (!build_options.use_tls) return null;
+        if (comptime !@hasDecl(tls.Connection, "peerCertificate")) return null;
+        return if (self.tls_conn) |*c| c.peerCertificate() else null;
+    }
+
     /// A borrowed view of the layers above, for the parts of the library
     /// that are shared with the client and so can hold neither `Connection`.
     pub fn transport(self: *Connection) Transport {
@@ -1493,6 +1503,7 @@ pub fn Server(comptime Ctx: type) type {
                 .remote_address = connection.peerAddress(),
                 .listener = l.config,
                 .secure = (build_options.use_tls and l.tls_auth != null) or connection.proxied_secure,
+                .peer_certificate = connection.peerCertificate(),
                 ._timeout_context = timer,
                 ._set_timeout = setRequestTimeout,
             };

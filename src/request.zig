@@ -60,6 +60,9 @@ pub const Request = struct {
     /// `X-Forwarded-Host` from the nearest trusted proxy, under
     /// `ServerConfig.trusted_proxy_hops`. See `host`.
     forwarded_host: ?[]const u8 = null,
+    /// The client's TLS certificate (the leaf, DER), as the engine found it
+    /// on the connection. See `peerCertificate`.
+    peer_certificate: ?[]const u8 = null,
     /// This request's ID, set by the RequestId middleware: for log lines,
     /// traces and error reports. Empty without it.
     id: []const u8 = "",
@@ -106,6 +109,16 @@ pub const Request = struct {
         return self.forwarded_host orelse self.headers.get("Host");
     }
 
+    /// The certificate the client presented on this server's TLS (mutual
+    /// TLS, `ServerConfig.Tls.client_auth`): the leaf, DER-encoded, already
+    /// verified against the listener's CAs. Null without TLS, without
+    /// `client_auth`, when the client sent none (`.request` mode), or with
+    /// a TLS module that does not expose it (`Connection.peerCertificate`).
+    /// Borrowed from the connection: valid for this request.
+    pub fn peerCertificate(self: *const Request) ?[]const u8 {
+        return self.peer_certificate;
+    }
+
     pub fn reset(self: *Request) void {
         const arena = self.arena;
         const io = self.io;
@@ -120,6 +133,7 @@ pub const Request = struct {
         const addr = self.remote_address;
         const listener = self.listener;
         const secure = self.secure;
+        const peer_certificate = self.peer_certificate;
         self.* = .{
             .arena = arena,
             .io = io,
@@ -130,6 +144,7 @@ pub const Request = struct {
             .remote_address = addr,
             .listener = listener,
             .secure = secure,
+            .peer_certificate = peer_certificate,
             ._timeout_context = timeout_context,
             ._set_timeout = set_timeout,
         };
@@ -737,6 +752,22 @@ test "Request.setTimeout: forwards relative, absolute, and disabled deadlines" {
     req.setTimeout(.none);
     try std.testing.expect(probe.last == .none);
     try std.testing.expectEqual(@as(usize, 3), probe.calls);
+}
+
+test "Request.peerCertificate: belongs to the connection, so it outlives reset" {
+    var req: Request = .{
+        .arena = std.testing.allocator,
+        .io = std.testing.io,
+        .parser = undefined,
+        .transport = undefined,
+    };
+    try std.testing.expectEqual(@as(?[]const u8, null), req.peerCertificate());
+    const der = "\x30\x82\x01\x00";
+    req.peer_certificate = der;
+    req.url = "/a";
+    req.reset();
+    try std.testing.expectEqualStrings(der, req.peerCertificate().?);
+    try std.testing.expectEqualStrings("", req.url);
 }
 
 test "Request: no std.Io.Reader sentinel escapes the body-reading API" {
