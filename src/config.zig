@@ -189,11 +189,6 @@ pub const ServerConfig = struct {
             key: []const u8,
         };
 
-        pub const Pem = struct {
-            cert: []const u8,
-            key: []const u8,
-        };
-
         pub const ClientAuth = struct {
             /// Certificate authorities used to verify client certificates.
             /// `.none` is rejected by listen().
