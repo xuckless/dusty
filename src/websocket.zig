@@ -158,7 +158,33 @@ pub const WebSocket = struct {
             // The reads inside can only report the sentinel; the transport
             // knows what actually happened.
             error.ReadFailed => self.transport.getReadError() orelse error.Unexpected,
-            else => |e| e,
+            else => |e| {
+                // A peer that broke the protocol is told why before the
+                // connection ends (RFC 6455 §7.1.7), if sending is still
+                // open; what it sent after is not read.
+                if (failureCloseCode(e)) |code| self.writeClose(code, "") catch {};
+                return e;
+            },
+        };
+    }
+
+    /// The close code that answers a receive failure, or null for one that
+    /// is not the peer's doing (out of memory, say).
+    fn failureCloseCode(err: anyerror) ?CloseCode {
+        return switch (err) {
+            Error.MessageTooLarge => .too_large,
+            Error.InvalidUtf8 => .invalid_payload,
+            Error.ReservedFlags,
+            Error.LargeControlFrame,
+            Error.InvalidOpcode,
+            Error.UnexpectedContinuation,
+            Error.NestedFragment,
+            Error.UnmaskedClientFrame,
+            Error.MaskedServerFrame,
+            Error.FragmentedControlFrame,
+            Error.InvalidClosePayload,
+            => .protocol_error,
+            else => null,
         };
     }
 
@@ -754,6 +780,50 @@ test "WebSocket: a close reason that is not UTF-8 is answered with 1007" {
     try std.testing.expectEqual(1007, std.mem.readInt(u16, written[2..4], .big));
 }
 
+/// What a server socket fed `frames` fails with, and the close code it
+/// sends first.
+fn expectFailureClose(frames: []const u8, max_message_size: usize, expected: anyerror, code: u16) !void {
+    var reader: std.Io.Reader = undefined;
+    var buf: [64]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&buf);
+    var ws = serverSocketOver(frames, &reader, &out);
+    defer ws.deinit();
+    ws.max_message_size = max_message_size;
+
+    try std.testing.expectError(expected, ws.receive());
+    const written = out.buffered();
+    try std.testing.expectEqual(4, written.len);
+    try std.testing.expectEqual(0x88, written[0]);
+    try std.testing.expectEqual(2, written[1]);
+    try std.testing.expectEqual(code, std.mem.readInt(u16, written[2..4], .big));
+    // Sending is over.
+    try std.testing.expectError(error.EndOfStream, ws.send(.text, "late"));
+}
+
+test "WebSocket: a failed receive sends the close code that says why" {
+    // Masked with a zero key. A text message that is not UTF-8: 1007.
+    try expectFailureClose(&.{ 0x81, 0x81, 0x00, 0x00, 0x00, 0x00, 0xFF }, 1024, WebSocket.Error.InvalidUtf8, 1007);
+    // The same in two pieces, checked once whole.
+    try expectFailureClose(&.{ 0x01, 0x81, 0x00, 0x00, 0x00, 0x00, 0xC3, 0x80, 0x81, 0x00, 0x00, 0x00, 0x00, 0xFF }, 1024, WebSocket.Error.InvalidUtf8, 1007);
+    // One frame over `max_message_size`: 1009, before its payload is read.
+    try expectFailureClose(&.{ 0x82, 0x84, 0x00, 0x00, 0x00, 0x00 }, 3, WebSocket.Error.MessageTooLarge, 1009);
+    // Pieces that add up to more: 1009.
+    try expectFailureClose(&.{ 0x02, 0x82, 0x00, 0x00, 0x00, 0x00, 1, 2, 0x80, 0x82, 0x00, 0x00, 0x00, 0x00, 3, 4 }, 3, WebSocket.Error.MessageTooLarge, 1009);
+    // A protocol error (an unmasked client frame): 1002.
+    try expectFailureClose(&.{ 0x81, 0x01, 'a' }, 1024, WebSocket.Error.UnmaskedClientFrame, 1002);
+}
+
+test "WebSocket: a receive that fails on the transport sends no close" {
+    // Cut off inside a frame header.
+    var reader: std.Io.Reader = undefined;
+    var buf: [64]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&buf);
+    var ws = serverSocketOver(&.{0x81}, &reader, &out);
+    defer ws.deinit();
+    try std.testing.expect(std.meta.isError(ws.receive()));
+    try std.testing.expectEqual(0, out.buffered().len);
+}
+
 test "WebSocket: readFrame rejects RSV bits" {
 
     // Frame with RSV1 bit set (0x40)
@@ -1072,17 +1142,20 @@ test "WebSocket: RSV1 is passed on as compressed once allowed, and only on a dat
     var ws = WebSocket.init(std.testing.io, .{ .reader = &reader, .writer = &writer }, std.testing.allocator, 1);
     defer ws.deinit();
 
-    // Not negotiated: refused.
+    // Not negotiated: refused, with close 1002.
     try std.testing.expectError(WebSocket.Error.ReservedFlags, ws.receive());
+    try std.testing.expectEqualSlices(u8, &.{ 0x88, 2, 0x03, 0xEA }, writer.buffered());
 
     reader = .fixed(&frames);
-    ws.rsv1_allowed = true;
-    const msg = try ws.receive();
+    writer = .fixed(&out);
+    var ws2 = WebSocket.init(std.testing.io, .{ .reader = &reader, .writer = &writer }, std.testing.allocator, 1);
+    defer ws2.deinit();
+    ws2.rsv1_allowed = true;
+    const msg = try ws2.receive();
     try std.testing.expect(msg.compressed);
     try std.testing.expectEqualStrings("hi", msg.data);
-    // RSV1 on a control frame is still an error.
-    try std.testing.expectError(WebSocket.Error.ReservedFlags, ws.receive());
-
-    try ws.sendCompressed(.text, "x");
+    try ws2.sendCompressed(.text, "x");
     try std.testing.expectEqual(@as(u8, 0xC1), out[0]);
+    // RSV1 on a control frame is still an error.
+    try std.testing.expectError(WebSocket.Error.ReservedFlags, ws2.receive());
 }
