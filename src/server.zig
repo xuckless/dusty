@@ -801,7 +801,13 @@ pub fn Server(comptime Ctx: type) type {
             self.ready.set(self.io);
             self.settled.set(self.io);
 
-            for (active) |*l| log.info("Listening on {f}", .{l.address});
+            {
+                // Logging allocates, which can swallow a cancel (see
+                // `placement.concurrent`): it must reach the wait below.
+                const protection = self.io.swapCancelProtection(.blocked);
+                defer _ = self.io.swapCancelProtection(protection);
+                for (active) |*l| log.info("Listening on {f}", .{l.address});
+            }
 
             var connections: std.Io.Group = .init;
             defer {
@@ -1077,8 +1083,9 @@ pub fn Server(comptime Ctx: type) type {
                     => {
                         backoff_ms = if (backoff_ms == 0) min_accept_backoff_ms else @min(backoff_ms * 2, max_accept_backoff_ms);
                         {
-                            // Logging allocates too: the cancel must reach
-                            // the sleep below (see the spawn further down).
+                            // Logging allocates, which can swallow a cancel
+                            // (see `placement.concurrent`): it must reach the
+                            // sleep below.
                             const protection = self.io.swapCancelProtection(.blocked);
                             defer _ = self.io.swapCancelProtection(protection);
                             log.warn("Accept failed: {}; retrying in {d}ms", .{ err, backoff_ms });
@@ -1105,19 +1112,6 @@ pub fn Server(comptime Ctx: type) type {
                     return err;
                 };
                 _ = self.busy.fetchAdd(.{ .count = 1 }, .acq_rel);
-                // Spawning is not a cancelation point, yet under
-                // std.Io.Threaded it can swallow a cancel: a Debug allocator
-                // captures a stack trace for the new task, and Zig 0.17's
-                // unwinder takes a cancelable lock (`std.debug.SelfInfo`'s
-                // module mutex, through `std.Options.debug_io`). Threaded
-                // keeps cancel state per OS thread, whichever instance asks,
-                // so when that lock is contended it acknowledges the cancel
-                // pending on this task and the unwinder drops the error.
-                // Every later syscall of the task then runs uncancelable, the
-                // next `accept` blocks for good, and the shutdown with it.
-                // Blocked here, the cancel stays pending for that `accept`.
-                const protection = self.io.swapCancelProtection(.blocked);
-                defer _ = self.io.swapCancelProtection(protection);
                 // On the executor that accepted it, for its whole life.
                 placement.concurrent(connections, self.io, .local, handleConnectionWrapper, .{ self, l, stream }) catch |err| {
                     log.err("Failed to spawn connection handler: {}", .{err});
