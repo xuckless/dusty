@@ -32,6 +32,7 @@ const TestClient = struct {
     const Resp = struct {
         status: u16 = 0,
         content_length: ?[]u8 = null,
+        has_date: bool = false,
         body: std.ArrayList(u8) = .empty,
         trailer: ?[]u8 = null,
         closed: bool = false,
@@ -162,6 +163,7 @@ const TestClient = struct {
         }
         if (std.mem.eql(u8, n, ":status")) resp.status = std.fmt.parseInt(u16, v, 10) catch 0;
         if (std.mem.eql(u8, n, "content-length")) resp.content_length = self.gpa.dupe(u8, v) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+        if (std.mem.eql(u8, n, "date")) resp.has_date = true;
         return 0;
     }
 
@@ -261,6 +263,7 @@ test "HTTP/2: GET over prior-knowledge h2c reaches the router" {
 
     try std.testing.expectEqual(@as(u16, 200), client.get(ok).status);
     try std.testing.expectEqualStrings("hello", client.get(ok).body.items);
+    try std.testing.expect(client.get(ok).has_date);
     try std.testing.expectEqual(@as(u16, 200), client.get(head).status);
     try std.testing.expectEqualStrings("5", client.get(head).content_length.?);
     try std.testing.expectEqualStrings("", client.get(head).body.items);

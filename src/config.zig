@@ -1,4 +1,5 @@
 const std = @import("std");
+const ContentType = @import("http.zig").ContentType;
 
 /// Where a TLS peer's certificate authorities are loaded from. Shared by the
 /// client (verifying server certificates) and the server (verifying client
@@ -267,6 +268,11 @@ pub const ServerConfig = struct {
         /// bytes on the wire. Size memory for `max_connections` of these,
         /// not for what a peer has to send to get one.
         max_body_size: usize = 1_048_576, // 1MB default
+        /// A request that declares a longer body in `Content-Length` is
+        /// answered 413 before its handler runs, without reading the body,
+        /// and before any 100 Continue. Unlike `max_body_size` this bounds
+        /// streamed bodies too. Null leaves it to `max_body_size`.
+        max_content_length: ?usize = null,
         /// Undo `Content-Encoding` on request bodies. A coding we cannot
         /// undo fails the read with `error.UnsupportedContentEncoding`
         /// rather than handing the handler bytes it would misread.
@@ -314,6 +320,12 @@ pub const ServerConfig = struct {
         /// buffer sends what passes through it, a file or a body written in
         /// pieces, in more, smaller records.
         write_buffer_size: usize = 16384,
+        /// Send a `Date` header on every response (RFC 9110 6.6.1 requires
+        /// it of an origin server with a clock), unless the handler set one.
+        date: bool = true,
+        /// The Content-Type of a buffered body whose handler set none, as
+        /// Fiber does. Null sends such a body without one.
+        default_content_type: ?ContentType = .text,
     };
 };
 

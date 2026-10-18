@@ -1133,6 +1133,13 @@ pub fn Server(comptime Ctx: type) type {
             }
         }
 
+        /// Applies `ServerConfig.response` to a response the server built,
+        /// for every engine.
+        pub fn configureResponse(self: *const Self, res: *Response) void {
+            res.send_date = self.config.response.date;
+            res.default_content_type = self.config.response.default_content_type;
+        }
+
         /// The client address for a request from `peer` with `headers`,
         /// through `X-Forwarded-For` as far as `trusted_proxy_hops` allows.
         pub fn clientAddress(self: *const Self, peer: std.Io.net.IpAddress, headers: *const Headers) std.Io.net.IpAddress {
@@ -1147,7 +1154,7 @@ pub fn Server(comptime Ctx: type) type {
         /// handler's, and the caller decides what it means for its stream.
         pub fn dispatch(self: *Self, req: *Request, res: *Response) !void {
             const found = self.router.findHandler(req) catch |err| switch (err) {
-                error.InvalidEscapeSequence, error.TooManyQueryParams => {
+                error.InvalidEscapeSequence, error.TooManyQueryParams, error.TooManyParams => {
                     res.status = .bad_request;
                     return;
                 },
@@ -1281,11 +1288,27 @@ pub fn Server(comptime Ctx: type) type {
                 log.debug("Received: {f} {s}", .{ request.method, request.url });
 
                 var response = try Response.init(request.arena, connection, self.config.request.max_header_count);
+                self.configureResponse(&response);
                 defer response.deinit();
                 response.head = request.method == .head;
                 response.http10 = request.version_major == 1 and request.version_minor == 0;
                 response.request = &request;
                 request.response = &response;
+
+                // A body declared longer than allowed is refused unread
+                // (and before any 100 Continue): 413, and the connection
+                // closes, since the body may still be coming.
+                if (self.config.request.max_content_length) |max| {
+                    if (request.content_length) |len| if (len > max) {
+                        response.status = .payload_too_large;
+                        response.content_type = .text;
+                        response.body = "413 Content Too Large\n";
+                        response.keepalive = false;
+                        try response.write();
+                        if (hasUnreadInput(connection, &parser)) try self.lingeringClose(connection, timer, &idle_read_buffer, &buffers);
+                        return;
+                    };
+                }
 
                 // Handle Expect header (100-continue)
                 if (request.headers.get("Expect")) |expect| {
@@ -1317,7 +1340,7 @@ pub fn Server(comptime Ctx: type) type {
 
                 const found = self.router.findHandler(&request) catch |err| switch (err) {
                     // The request's own doing, and the connection is fine.
-                    error.InvalidEscapeSequence, error.TooManyQueryParams => {
+                    error.InvalidEscapeSequence, error.TooManyQueryParams, error.TooManyParams => {
                         response.status = .bad_request;
                         response.keepalive = false;
                         try response.write();

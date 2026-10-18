@@ -195,10 +195,12 @@ pub fn Router(comptime Ctx: type) type {
                 // Find or create child
                 var child = findChild(current, segment, kind);
                 if (child) |existing| {
-                    // One wildcard node captures under one name, and a route
-                    // reading another would never find its value.
-                    if (kind == .wildcard and !std.mem.eql(u8, existing.param_name.?, param_name.?)) {
-                        @panic("wildcard registered under two names");
+                    // One param or wildcard node captures under one name, and
+                    // a route reading another would never find its value.
+                    if ((kind == .wildcard or kind == .param) and !std.mem.eql(u8, existing.param_name.?, param_name.?)) {
+                        std.debug.panic("route {s}: {s} conflicts with {c}{s}, registered at the same position by another route", .{
+                            path, segment, segment[0], existing.param_name.?,
+                        });
                     }
                 }
                 if (child == null) {
@@ -229,6 +231,11 @@ pub fn Router(comptime Ctx: type) type {
                 }
 
                 current = child.?;
+            }
+
+            // A second registration would silently replace the first.
+            if (current.route != null) {
+                std.debug.panic("route {s} {s} is registered twice", .{ if (method) |m| m.name() else "ANY", path });
             }
 
             // Create and store route
