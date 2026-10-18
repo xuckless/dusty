@@ -703,6 +703,12 @@ pub fn Engine(comptime Ctx: type) type {
                     resetStream(conn, stream, c.NGHTTP2_CANCEL);
                     return error.Canceled;
                 }
+                // `Response.abort`: the reset is the abort.
+                if (err == error.ResponseAborted) {
+                    log.debug("HTTP/2 stream {d}: response aborted", .{stream.id});
+                    resetStream(conn, stream, c.NGHTTP2_CANCEL);
+                    return;
+                }
                 if (stream.reset or err == error.ConnectionResetByPeer) {
                     log.debug("HTTP/2 stream {d} reset: {}", .{ stream.id, err });
                 } else {

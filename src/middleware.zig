@@ -82,6 +82,8 @@ pub fn Executor(comptime Ctx: type) type {
                 // Connection-level failures can't produce a response; propagate
                 // so the connection loop aborts.
                 error.ReadFailed, error.WriteFailed, error.Canceled => return err,
+                // `Response.abort`: the server ends the response itself.
+                error.ResponseAborted => return err,
                 // Handler/middleware errors: prepare an error response (500, or
                 // the app's uncaughtError) and return normally so the server
                 // writes it, instead of tearing down the connection with no

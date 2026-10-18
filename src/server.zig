@@ -1866,6 +1866,12 @@ pub fn Server(comptime Ctx: type) type {
                 executor.run() catch |err| switch (err) {
                     error.ReadFailed => return connection.getReadError() orelse error.Unexpected,
                     error.WriteFailed => return connection.getWriteError() orelse error.Unexpected,
+                    // `Response.abort`: the connection closes under the
+                    // unfinished response, which is the abort.
+                    error.ResponseAborted => {
+                        log.debug("Response aborted ({f} {s})", .{ request.method, request.url });
+                        return;
+                    },
                     else => |e| return e,
                 };
 
