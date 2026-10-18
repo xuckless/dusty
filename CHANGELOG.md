@@ -12,6 +12,16 @@ All notable changes to this project will be documented in this file.
 - A malformed request head (anything llhttp refuses, or a connection that
   ends inside one) is now logged at info instead of err, as a failed TLS
   handshake is: any peer can send one at will.
+- A request head llhttp refuses now gets `400 Bad Request` with
+  `Connection: close`, and the connection a lingering close (as after a
+  431), so the peer reads the answer and a FIN rather than a reset for what
+  it sent after the head. An HTTP/2 connection preface on an HTTP/1.x
+  connection (a client that went ahead with HTTP/2 although ALPN settled on
+  HTTP/1.1) gets the lingering close without the 400.
+- Added `Response.abort()`, for a handler that cannot finish a response it
+  has started: HTTP/2 resets the stream (CANCEL), HTTP/1.x closes the
+  connection without the rest of the body. It returns
+  `error.ResponseAborted`, which is not logged as a server error.
 - An HTTP/2 connection whose peer hangs up in the middle of a request's
   header block now closes. The writer took the half-received stream for one
   whose handler was still running, and waited for it for good.

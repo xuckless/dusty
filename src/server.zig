@@ -1757,8 +1757,9 @@ pub fn Server(comptime Ctx: type) type {
                     // than a reset for the bytes it sent after. An HTTP/2
                     // preface (a client that went ahead with HTTP/2 although
                     // ALPN did not agree on it) gets the close alone: it
-                    // would read an HTTP/1.1 answer as a frame. Any peer can
-                    // send these, so they are not logged as server errors.
+                    // would read an HTTP/1.1 answer as a frame. Logged at
+                    // info, as `runConnection` logs the other malformed
+                    // requests: any peer can send one.
                     error.InvalidMethod,
                     error.InvalidUrl,
                     error.InvalidHeaderToken,
@@ -1769,7 +1770,7 @@ pub fn Server(comptime Ctx: type) type {
                     error.UnexpectedContentLength,
                     error.ParseFailed,
                     => |e| {
-                        log.debug("Malformed request head: {}", .{e});
+                        log.info("Malformed request: {}", .{e});
                         if (!std.mem.startsWith(u8, connection.reader.buffered(), h2_preface_line)) {
                             sendBadRequest(connection.writer) catch
                                 return connection.getWriteError() orelse error.Unexpected;
