@@ -3096,3 +3096,58 @@ test "Server: a body over max_body_size is 413, a declared one over max_content_
     const declared = try rawHead(io, &server, "POST /buffer HTTP/1.1\r\nHost: x\r\nContent-Length: 5000\r\nExpect: 100-continue\r\n\r\n", &buf2);
     try std.testing.expect(std.mem.startsWith(u8, declared, "HTTP/1.1 413 Content Too Large\r\n"));
 }
+
+test "Server: a head that does not arrive within read_header closes the connection; a slow body does not" {
+    const io = std.testing.io;
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .listeners = loopback,
+        .timeout = .{ .request = .fromSeconds(5), .read_header = .fromMilliseconds(200) },
+    }, {});
+    defer server.deinit();
+    server.router.post("/echo", struct {
+        fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+            res.body = (try req.body()) orelse "";
+        }
+    }.handle);
+    var future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer future.cancel(io) catch {};
+    try server.ready.wait(io);
+
+    { // Slowloris: half a head, then nothing.
+        const stream = try server.address.ip.connect(io, .{ .mode = .stream });
+        defer stream.close(io);
+        var wbuf: [64]u8 = undefined;
+        var w = stream.writer(io, &wbuf);
+        try w.interface.writeAll("GET / HTTP/1.1\r\nHost: x\r\n");
+        try w.interface.flush();
+        const start: std.Io.Clock.Timestamp = .now(io, .awake);
+        var rbuf: [64]u8 = undefined;
+        var r = stream.reader(io, &rbuf);
+        // The server hangs up: end of stream, or a reset.
+        _ = r.interface.peekByte() catch {};
+        const waited = start.durationTo(.now(io, .awake)).raw.toMilliseconds();
+        try std.testing.expect(waited < 2000);
+    }
+    { // A whole head at once, then a body slower than read_header.
+        const stream = try server.address.ip.connect(io, .{ .mode = .stream });
+        defer stream.close(io);
+        var wbuf: [128]u8 = undefined;
+        var w = stream.writer(io, &wbuf);
+        try w.interface.writeAll("POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\nConnection: close\r\n\r\n");
+        try w.interface.flush();
+        try io.sleep(.fromMilliseconds(400), .awake);
+        try w.interface.writeAll("late");
+        try w.interface.flush();
+        var rbuf: [512]u8 = undefined;
+        var r = stream.reader(io, &rbuf);
+        var out: [512]u8 = undefined;
+        var fw: std.Io.Writer = .fixed(&out);
+        _ = r.interface.streamRemaining(&fw) catch {};
+        try std.testing.expect(std.mem.startsWith(u8, fw.buffered(), "HTTP/1.1 200 OK\r\n"));
+        try std.testing.expect(std.mem.endsWith(u8, fw.buffered(), "late"));
+    }
+}
