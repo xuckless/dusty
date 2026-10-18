@@ -3281,3 +3281,116 @@ test "Server: router.use with RequestId and Logger, and nested groups" {
     // The handler saw the same ID.
     try std.testing.expect(std.mem.endsWith(u8, resp, id));
 }
+
+/// The whole response to `request`, sent on a new connection.
+fn rawAll(io: std.Io, server: *dusty.Server(void), request: []const u8, out: []u8) ![]const u8 {
+    const stream = try server.address.ip.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    var wbuf: [512]u8 = undefined;
+    var w = stream.writer(io, &wbuf);
+    try w.interface.writeAll(request);
+    try w.interface.flush();
+    var rbuf: [1024]u8 = undefined;
+    var r = stream.reader(io, &rbuf);
+    var fw: std.Io.Writer = .fixed(out);
+    _ = r.interface.streamRemaining(&fw) catch |err| switch (err) {
+        error.WriteFailed => {},
+        else => |e| return e,
+    };
+    return fw.buffered();
+}
+
+const WhoHandler = struct {
+    fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+        try res.print(.text, "{f} secure={} host={s}", .{ req.remote_address, req.secure, req.host() orelse "-" });
+    }
+};
+
+test "Server: a PROXY protocol listener takes the client address from v1 and v2 headers" {
+    const io = std.testing.io;
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .listeners = &.{.{ .address = loopback_addr, .proxy_protocol = true }},
+    }, {});
+    defer server.deinit();
+    server.router.get("/who", WhoHandler.handle);
+    var future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer future.cancel(io) catch {};
+    try server.ready.wait(io);
+
+    var out: [2048]u8 = undefined;
+    const v1 = try rawAll(io, &server, "PROXY TCP4 192.0.2.7 198.51.100.2 56324 443\r\nGET /who HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n", &out);
+    try std.testing.expect(std.mem.startsWith(u8, v1, "HTTP/1.1 200 OK\r\n"));
+    try std.testing.expect(std.mem.endsWith(u8, v1, "192.0.2.7:56324 secure=false host=example.com"));
+
+    // v2, IPv6, with the SSL TLV: the client spoke TLS to the proxy.
+    var v2: [16 + 36 + 8]u8 = @splat(0);
+    @memcpy(v2[0..12], "\r\n\r\n\x00\r\nQUIT\n");
+    v2[12] = 0x21;
+    v2[13] = 0x21;
+    std.mem.writeInt(u16, v2[14..16], 36 + 8, .big);
+    v2[16 + 15] = 9; // ::9
+    std.mem.writeInt(u16, v2[16 + 32 ..][0..2], 4000, .big);
+    v2[16 + 36] = 0x20;
+    std.mem.writeInt(u16, v2[16 + 37 ..][0..2], 5, .big);
+    v2[16 + 39] = 0x01;
+    var req_buf: [256]u8 = undefined;
+    var rw: std.Io.Writer = .fixed(&req_buf);
+    try rw.writeAll(&v2);
+    try rw.writeAll("GET /who HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n");
+    const resp2 = try rawAll(io, &server, rw.buffered(), &out);
+    try std.testing.expect(std.mem.endsWith(u8, resp2, "[::9]:4000 secure=true host=example.com"));
+
+    // No header: the connection is closed without an answer (a reset,
+    // since the request was left unread, or a plain close).
+    if (rawAll(io, &server, "GET /who HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n", &out)) |none| {
+        try std.testing.expectEqual(@as(usize, 0), none.len);
+    } else |err| switch (err) {
+        error.ReadFailed => {},
+        else => |e| return e,
+    }
+}
+
+test "Server: X-Forwarded-Proto and X-Forwarded-Host from a trusted proxy" {
+    const io = std.testing.io;
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback, .trusted_proxy_hops = 1 }, {});
+    defer server.deinit();
+    server.router.get("/who", WhoHandler.handle);
+    var future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer future.cancel(io) catch {};
+    try server.ready.wait(io);
+
+    var out: [2048]u8 = undefined;
+    const resp = try rawAll(io, &server, "GET /who HTTP/1.1\r\nHost: internal:8080\r\nX-Forwarded-For: 203.0.113.9\r\nX-Forwarded-Proto: http, https\r\nX-Forwarded-Host: shop.example.com\r\nConnection: close\r\n\r\n", &out);
+    try std.testing.expect(std.mem.endsWith(u8, resp, "203.0.113.9:0 secure=true host=shop.example.com"));
+
+    // A host with characters no host has is ignored.
+    const bad = try rawAll(io, &server, "GET /who HTTP/1.1\r\nHost: internal:8080\r\nX-Forwarded-Host: evil.com/x y\r\nConnection: close\r\n\r\n", &out);
+    try std.testing.expect(std.mem.endsWith(u8, bad, "secure=false host=internal:8080"));
+}
+
+test "Server: forwarding headers are ignored without trusted hops" {
+    const io = std.testing.io;
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
+    defer server.deinit();
+    server.router.get("/who", WhoHandler.handle);
+    var future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer future.cancel(io) catch {};
+    try server.ready.wait(io);
+
+    var out: [2048]u8 = undefined;
+    const resp = try rawAll(io, &server, "GET /who HTTP/1.1\r\nHost: internal:8080\r\nX-Forwarded-For: 203.0.113.9\r\nX-Forwarded-Proto: https\r\nX-Forwarded-Host: shop.example.com\r\nConnection: close\r\n\r\n", &out);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "127.0.0.1:") != null);
+    try std.testing.expect(std.mem.endsWith(u8, resp, "secure=false host=internal:8080"));
+}

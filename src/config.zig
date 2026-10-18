@@ -95,6 +95,16 @@ pub const Listener = struct {
     /// `Tls.alpn_protocols` instead. The deprecated `Upgrade: h2c` is not
     /// supported.
     http2_prior_knowledge: bool = false,
+    /// Every connection here starts with a PROXY protocol header, v1 or v2
+    /// (HAProxy, nginx `proxy_protocol on`, AWS NLB, Envoy), read before
+    /// TLS: the client address it carries becomes `Request.remote_address`,
+    /// and v2's SSL TLV marks the request secure. A connection without a
+    /// valid header is closed. The header must arrive within
+    /// `Timeout.read_header`.
+    ///
+    /// Only for a listener that nothing but the proxy can reach, since
+    /// whoever connects chooses the address the header claims.
+    proxy_protocol: bool = false,
     /// How many accept loops share the socket. With io_uring, an accept
     /// completes at most once per trip through the event loop, so a single
     /// loop takes one connection per trip however many are queued, which

@@ -408,7 +408,7 @@ pub fn Engine(comptime Ctx: type) type {
                 .server = server,
                 .connection = connection,
                 .listener = listener,
-                .secure = secure,
+                .secure = secure or connection.proxied_secure,
                 .io = server.io,
                 .allocator = server.allocator,
                 .config = server.config.http2,
@@ -701,7 +701,7 @@ pub fn Engine(comptime Ctx: type) type {
                     return response.write();
                 };
             }
-            request.remote_address = server.clientAddress(conn.connection.stream.socket.address, &request.headers);
+            server.applyForwarded(&request, conn.connection);
 
             if (request.headers.get("Expect")) |expect| {
                 if (std.ascii.eqlIgnoreCase(expect, "100-continue")) {
