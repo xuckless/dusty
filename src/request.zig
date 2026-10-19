@@ -1,4 +1,5 @@
 const std = @import("std");
+const DrainHooks = @import("drain_hooks.zig").DrainHooks;
 
 const http = @import("http.zig");
 const RouteInfo = @import("router.zig").RouteInfo;
@@ -78,6 +79,10 @@ pub const Request = struct {
     /// wind down rather than be cut off at `timeout.shutdown`. Null in a
     /// request the server did not build.
     drain: ?*std.Io.Event = null,
+    /// The server's drain callbacks (`DrainHooks`): what a long-lived
+    /// request registers with instead of keeping a task waiting on `drain`.
+    /// Null in a request the server did not build.
+    drain_hooks: ?*DrainHooks = null,
 
     arena: std.mem.Allocator,
     io: std.Io = undefined,
@@ -145,6 +150,7 @@ pub const Request = struct {
         const listener = self.listener;
         const secure = self.secure;
         const drain = self.drain;
+        const drain_hooks = self.drain_hooks;
         const peer_certificate = self.peer_certificate;
         self.* = .{
             .arena = arena,
@@ -157,6 +163,7 @@ pub const Request = struct {
             .listener = listener,
             .secure = secure,
             .drain = drain,
+            .drain_hooks = drain_hooks,
             .peer_certificate = peer_certificate,
             ._timeout_context = timeout_context,
             ._set_timeout = set_timeout,

@@ -27,6 +27,7 @@ const have_auto_cancel = @import("deadline.zig").have_auto_cancel;
 const Watch = @import("deadline.zig").Watch;
 const Timer = @import("deadline.zig").Timer;
 const placement = @import("placement.zig");
+const DrainHooks = @import("drain_hooks.zig").DrainHooks;
 /// The HTTP/2 engine, with the `use_http2` build option.
 const proxy_protocol = @import("proxy_protocol.zig");
 const h2 = if (build_options.use_http2) @import("server/h2.zig") else struct {};
@@ -673,6 +674,8 @@ pub fn Server(comptime Ctx: type) type {
         /// `Request.drain`, to finish early rather than be cut off at
         /// `timeout.shutdown`.
         draining: std.Io.Event = .unset,
+        /// Run when `draining` is set: see `Request.drain_hooks`.
+        drain_hooks: DrainHooks = .{},
         /// Set with `ready`, or when `run` stops before it is listening,
         /// with `start_error` saying why.
         settled: std.Io.Event = .unset,
@@ -898,6 +901,7 @@ pub fn Server(comptime Ctx: type) type {
             defer {
                 _ = self.busy.fetchOr(.{ .draining = true }, .release);
                 self.draining.set(self.io);
+                self.drain_hooks.fire(self.io);
                 connections.cancel(self.io);
             }
 
@@ -1244,6 +1248,7 @@ pub fn Server(comptime Ctx: type) type {
             log.info("Graceful shutdown requested", .{});
             _ = self.busy.fetchOr(.{ .draining = true }, .acq_rel);
             self.draining.set(self.io);
+            self.drain_hooks.fire(self.io);
 
             // HTTP/2 connections get a two-phase GOAWAY (RFC 9113 §6.8): a
             // notice now, the final one a round trip later, when the PING
@@ -1766,6 +1771,7 @@ pub fn Server(comptime Ctx: type) type {
                 .listener = l.config,
                 .secure = (build_options.use_tls and l.config.tls != null) or connection.proxied_secure,
                 .drain = &self.draining,
+                .drain_hooks = &self.drain_hooks,
                 .peer_certificate = connection.peerCertificate(),
                 ._timeout_context = timer,
                 ._set_timeout = setRequestTimeout,
