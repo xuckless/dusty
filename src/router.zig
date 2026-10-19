@@ -70,11 +70,26 @@ pub fn Router(comptime Ctx: type) type {
             middlewares: []const Middleware(Ctx),
         };
 
+        /// One method's route in `static_routes`; the methods for one path
+        /// are a list.
+        const StaticRoute = struct {
+            method: Method,
+            route: *const Route,
+            next: ?*StaticRoute,
+        };
+
         arena: std.heap.ArenaAllocator,
         // Each HTTP method has its own radix tree
         trees: [256]?*Node,
         // Routes registered with `any`, tried after the method's own tree
         any_tree: ?*Node = null,
+        /// The routes with no parameter or wildcard, by their path in
+        /// canonical form ("/a/b"; "/" for the root), for `findHandler` to
+        /// find without walking a tree. A request path in that form that is
+        /// here for its method gets the route the tree walk would: at every
+        /// level the walk tries static children first, so a route of static
+        /// segments only wins over any parameter or wildcard route.
+        static_routes: std.StringHashMapUnmanaged(*StaticRoute) = .empty,
         // Global middlewares applied to all routes
         middlewares: []const Middleware(Ctx) = &.{},
         /// A route was registered: each route took a copy of the global
@@ -252,6 +267,38 @@ pub fn Router(comptime Ctx: type) type {
                 .middlewares = middlewares,
             };
             current.route = @ptrCast(route);
+
+            if (method) |m| if (std.mem.indexOfAny(u8, path, ":*") == null) {
+                // `path` without empty segments, as `canonicalPath` takes a
+                // request's.
+                var key: std.ArrayList(u8) = .empty;
+                var it = std.mem.splitScalar(u8, path, '/');
+                while (it.next()) |segment| {
+                    if (segment.len == 0) continue;
+                    try key.append(alloc, '/');
+                    try key.appendSlice(alloc, segment);
+                }
+                if (key.items.len == 0) try key.append(alloc, '/');
+                const entry = try self.static_routes.getOrPut(alloc, key.items);
+                const node = try alloc.create(StaticRoute);
+                node.* = .{ .method = m, .route = route, .next = if (entry.found_existing) entry.value_ptr.* else null };
+                entry.value_ptr.* = node;
+            };
+        }
+
+        /// The route registered for exactly `path` and `method` with no
+        /// parameter or wildcard, when `path` is in canonical form (no
+        /// empty segment, so no "//" and no trailing slash); null otherwise,
+        /// and the tree decides.
+        fn staticRoute(self: *const Self, method: Method, path: []const u8) ?*const Route {
+            if (path.len == 0 or path[0] != '/') return null;
+            if (path.len > 1 and path[path.len - 1] == '/') return null;
+            if (std.mem.indexOf(u8, path, "//") != null) return null;
+            var node = self.static_routes.get(path) orelse return null;
+            while (true) {
+                if (node.method == method) return node.route;
+                node = node.next orelse return null;
+            }
         }
 
         fn matchRecursive(node: *Node, req: *Request, path: []const u8, segments: []const []const u8, segment_offsets: []const usize, index: usize) !?*Node {
@@ -310,6 +357,11 @@ pub fn Router(comptime Ctx: type) type {
                 try parseQueryString(req, query_string);
                 break :blk req.url[0..query_start];
             } else req.url;
+
+            if (self.staticRoute(req.method, path)) |r| {
+                req.route = &r.info;
+                return r.*;
+            }
 
             // Count segments (max possible is number of '/' + 1)
             const max_segments = std.mem.count(u8, path, "/") + 1;
@@ -1044,6 +1096,48 @@ test "Router: static route has precedence over param route" {
 
     // Params should be empty (no :id captured)
     try std.testing.expect(req.params.get("id") == null);
+}
+
+test "Router: a static path finds what the tree walk would, in any spelling" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var router = TestRouter.init(std.testing.allocator);
+    defer router.deinit();
+
+    router.get("/users/:id", testHandler);
+    router.get("//users/new/", testHandler2);
+    router.post("/users/new", testHandler);
+    router.get("/", testHandler2);
+    router.get("/files/*rest", testHandler);
+
+    const cases = [_]struct { method: Method, url: []const u8, want: ?*const TestRouter.Handler }{
+        .{ .method = .get, .url = "/users/new", .want = testHandler2 },
+        .{ .method = .get, .url = "/users//new/", .want = testHandler2 },
+        .{ .method = .get, .url = "/users/new?x=1", .want = testHandler2 },
+        .{ .method = .post, .url = "/users/new", .want = testHandler },
+        .{ .method = .get, .url = "/users/7", .want = testHandler },
+        .{ .method = .get, .url = "/", .want = testHandler2 },
+        .{ .method = .get, .url = "", .want = testHandler2 },
+        .{ .method = .get, .url = "/files/a/b", .want = testHandler },
+        .{ .method = .put, .url = "/users/new", .want = null },
+        // A GET route answers HEAD, through the tree.
+        .{ .method = .head, .url = "/users/new", .want = testHandler2 },
+    };
+    for (cases) |case| {
+        var req = Request{
+            .method = case.method,
+            .url = case.url,
+            .arena = arena.allocator(),
+            .parser = undefined,
+            .transport = undefined,
+        };
+        const found = try router.findHandler(&req);
+        if (case.want) |want| {
+            try std.testing.expect(found != null);
+            try std.testing.expect(found.?.action == want);
+        } else try std.testing.expect(found == null);
+    }
 }
 
 test "Router: wildcard route basic matching" {
