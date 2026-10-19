@@ -322,8 +322,17 @@ pub const ServerConfig = struct {
         /// send on a stream before the handler reads them, which is also
         /// the stream's body buffer.
         stream_window: u31 = 64 * 1024,
-        /// Request body bytes in flight across all streams of a connection.
-        connection_window: u31 = 1024 * 1024,
+        /// The stream's window (and body buffer) from the handler's first
+        /// read of the body: a handler that takes the body gets it at a
+        /// pace the round trip does not throttle (64 KiB a round trip is
+        /// 6.5 MB/s at 10 ms), while one that never reads holds only
+        /// `stream_window`. No larger than `stream_window`: stays as is.
+        stream_window_reading: u31 = 1024 * 1024,
+        /// Request body bytes in flight across all streams of a
+        /// connection. It holds no memory of its own (the streams' body
+        /// buffers do), so it is generous: several uploads at once share
+        /// the round trip rather than wait for each other.
+        connection_window: u31 = 16 * 1024 * 1024,
         /// SETTINGS_MAX_HEADER_LIST_SIZE: the decoded size of a request's
         /// header block (names, values and 32 bytes each, RFC 9113 §6.5.2).
         max_header_list_size: u32 = 64 * 1024,

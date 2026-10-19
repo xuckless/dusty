@@ -320,6 +320,10 @@ pub fn Engine(comptime Ctx: type) type {
             /// Request body: DATA in, the handler out. Allocated on the
             /// first DATA frame; a request without a body never has one.
             body: ?std.Io.Queue(u8) = null,
+            /// The stream's receive window, which the body queue holds:
+            /// `stream_window`, raised to `stream_window_reading` once the
+            /// handler reads. Zero until set (`window`).
+            recv_window: u31 = 0,
             /// The request had no body at all (END_STREAM on its HEADERS),
             /// or its body has ended.
             body_done: bool = false,
@@ -367,6 +371,39 @@ pub fn Engine(comptime Ctx: type) type {
             discard_left: usize = 0,
 
             const Field = struct { name: []const u8, value: []const u8 };
+
+            fn window(stream: *const Stream) u31 {
+                return if (stream.recv_window != 0) stream.recv_window else stream.conn.config.stream_window;
+            }
+
+            /// The handler reads the body: the stream's window grows to
+            /// `stream_window_reading`, and the body queue with it, so the
+            /// session can still always put a whole window. Under the
+            /// mutex.
+            fn raiseWindow(stream: *Stream) void {
+                const conn = stream.conn;
+                const want = conn.config.stream_window_reading;
+                if (stream.recv_window != 0 or want <= conn.config.stream_window) return;
+                stream.recv_window = conn.config.stream_window;
+                if (stream.body_done or stream.reset or stream.discarding) return;
+                const buf = stream.arena.allocator().alloc(u8, want) catch return;
+                var bigger: std.Io.Queue(u8) = .init(buf);
+                if (stream.body) |*q| {
+                    // What is queued moves over, in order; nobody else gets
+                    // from it (this is the handler), and the session puts
+                    // only under the mutex.
+                    var scratch: [4096]u8 = undefined;
+                    while (true) {
+                        const n = q.getUncancelable(conn.io, &scratch, 0) catch break;
+                        if (n == 0) break;
+                        _ = bigger.putUncancelable(conn.io, scratch[0..n], 0) catch unreachable;
+                    }
+                }
+                if (c.nghttp2_session_set_local_window_size(conn.session, c.NGHTTP2_FLAG_NONE, stream.id, want) != 0) return;
+                stream.body = bigger;
+                stream.recv_window = want;
+                conn.kickWriter();
+            }
 
             /// A stream from the connection's spares (its arena reset, with
             /// what it grew to kept), or a new one. Under the mutex.
@@ -936,6 +973,7 @@ pub fn Engine(comptime Ctx: type) type {
                 const queue = blk: {
                     while (true) {
                         conn.lock();
+                        stream.raiseWindow();
                         const q = if (stream.body) |*q| q else null;
                         const done = stream.body_done;
                         const reset = stream.reset;
@@ -1525,7 +1563,7 @@ pub fn Engine(comptime Ctx: type) type {
                 return;
             }
             stream.discarding = true;
-            stream.discard_left = conn.config.stream_window;
+            stream.discard_left = stream.window();
             // What is queued was never credited back: credit it now.
             if (stream.body) |*q| {
                 var scratch: [4096]u8 = undefined;
@@ -1559,7 +1597,7 @@ pub fn Engine(comptime Ctx: type) type {
                 return 0;
             }
             if (stream.body == null) {
-                const buf = stream.arena.allocator().alloc(u8, conn.config.stream_window) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+                const buf = stream.arena.allocator().alloc(u8, stream.window()) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
                 stream.body = .init(buf);
             }
             // Cannot block: the queue holds a whole window, and the peer may

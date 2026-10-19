@@ -301,6 +301,25 @@ const Handlers = struct {
         try out.end();
     }
     const big_len = 1000 * 1000;
+    /// Reads the body only after a full window of it has queued up, and
+    /// answers with its length and a checksum.
+    fn late(req: *dusty.Request, res: *dusty.Response) !void {
+        try req.io.sleep(.fromMilliseconds(100), .awake);
+        var in_buf: [4096]u8 = undefined;
+        var body = try req.reader(&in_buf);
+        var hash: std.hash.Wyhash = .init(0);
+        var n: usize = 0;
+        while (true) {
+            const chunk = body.interface.peekGreedy(1) catch |err| switch (err) {
+                error.EndOfStream => break,
+                error.ReadFailed => return body.err orelse error.Unexpected,
+            };
+            hash.update(chunk);
+            n += chunk.len;
+            body.interface.toss(chunk.len);
+        }
+        try res.print(.text, "{d} {x}", .{ n, hash.final() });
+    }
 };
 
 const Fixture = struct {
@@ -317,6 +336,7 @@ const Fixture = struct {
         self.server.router.get("/trailers", Handlers.trailers);
         self.server.router.post("/ignore", Handlers.ignoreBody);
         self.server.router.get("/slow", Handlers.slow);
+        self.server.router.post("/late", Handlers.late);
         // The same handlers on routes that promise not to wait, which run
         // on the connection's reader when their request comes whole.
         self.server.router.addRouteWith(.get, "/nw/hello", Handlers.hello, .{ .no_wait = true });
@@ -493,6 +513,29 @@ test "HTTP/2: a request body larger than the windows is echoed back whole" {
     try std.testing.expectEqual(@as(u16, 200), client.get(id).status);
     try std.testing.expectEqual(body.len, client.get(id).body.items.len);
     try std.testing.expect(std.mem.eql(u8, body, client.get(id).body.items));
+}
+
+test "HTTP/2: a body read late moves to the bigger window whole and in order" {
+    const io = std.testing.io;
+    var fx: Fixture = undefined;
+    try fx.start(io);
+    defer fx.stop(io);
+
+    // A stream window's worth queues before the handler reads; the rest
+    // comes through the window the first read raises.
+    const body = try std.testing.allocator.alloc(u8, 3 * 1024 * 1024 + 17);
+    defer std.testing.allocator.free(body);
+    for (body, 0..) |*b, i| b.* = @truncate(i *% 131 +% (i >> 9));
+
+    var client: TestClient = undefined;
+    try client.init(std.testing.allocator, io, fx.server.address.ip);
+    defer client.deinit();
+    const a = try client.request("POST", "/late", body);
+    const b = try client.request("POST", "/late", body[0 .. 70 * 1024]);
+    try client.run();
+    var expect: [64]u8 = undefined;
+    try std.testing.expectEqualStrings(try std.fmt.bufPrint(&expect, "{d} {x}", .{ body.len, std.hash.Wyhash.hash(0, body) }), client.get(a).body.items);
+    try std.testing.expectEqualStrings(try std.fmt.bufPrint(&expect, "{d} {x}", .{ 70 * 1024, std.hash.Wyhash.hash(0, body[0 .. 70 * 1024]) }), client.get(b).body.items);
 }
 
 test "HTTP/2: trailers follow the body" {
