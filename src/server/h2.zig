@@ -331,6 +331,11 @@ pub fn Engine(comptime Ctx: type) type {
             submitted: bool = false,
             /// Response body: the handler in, the data provider out.
             out: ?std.Io.Queue(u8) = null,
+            /// Or a whole body in memory (`StreamSink.complete`), which the
+            /// provider takes in order: `parts[part][part_offset..]` is next.
+            parts: []const []const u8 = &.{},
+            part: usize = 0,
+            part_offset: usize = 0,
             /// Trailers for the provider to send after the body.
             trailer_nv: []c.nghttp2_nv = &.{},
             /// The handler ended the response.
@@ -921,7 +926,58 @@ pub fn Engine(comptime Ctx: type) type {
                     .end = end,
                     .writeError = writeError,
                     .peerGone = peerGone,
+                    .complete = complete,
                 } };
+            }
+
+            /// A whole response in memory: the head and the body submitted
+            /// together, with the body read straight from where it lies. The
+            /// stream ends on the last DATA frame, or on HEADERS when there
+            /// is no body.
+            fn complete(
+                ptr: *anyopaque,
+                status: http.Status,
+                headers: *const http.Headers,
+                content_length: ?usize,
+                parts: []const []const u8,
+                trailers: ?*const http.Headers,
+            ) std.Io.Writer.Error!void {
+                const self = fromPtr(ptr);
+                const stream = self.stream;
+                const conn = stream.conn;
+                const arena = stream.arena.allocator();
+                try head(ptr, status, headers, content_length);
+                const trailer_nv = try self.trailerFields(trailers);
+                var kept: usize = 0;
+                for (parts) |part| {
+                    if (part.len > 0) kept += 1;
+                }
+                const list = arena.alloc([]const u8, kept) catch return self.fail(error.SystemResources);
+                kept = 0;
+                for (parts) |part| {
+                    if (part.len == 0) continue;
+                    list[kept] = part;
+                    kept += 1;
+                }
+                conn.lock();
+                defer conn.unlock();
+                stream.parts = list;
+                stream.trailer_nv = trailer_nv;
+                stream.ended = true;
+                try self.submit(list.len > 0 or trailer_nv.len > 0);
+            }
+
+            /// The trailers as nghttp2 fields, in the stream's arena.
+            fn trailerFields(self: *StreamSink, trailers: ?*const http.Headers) std.Io.Writer.Error![]c.nghttp2_nv {
+                const t = trailers orelse return &.{};
+                const arena = self.stream.arena.allocator();
+                var trailer_nv: std.ArrayList(c.nghttp2_nv) = .empty;
+                var it = t.iterator();
+                while (it.next()) |entry| {
+                    const name = std.ascii.allocLowerString(arena, entry.key) catch return self.fail(error.SystemResources);
+                    trailer_nv.append(arena, field(name, entry.value)) catch return self.fail(error.SystemResources);
+                }
+                return trailer_nv.items;
             }
 
             fn fromPtr(ptr: *anyopaque) *StreamSink {
@@ -1093,18 +1149,10 @@ pub fn Engine(comptime Ctx: type) type {
                 const self = fromPtr(ptr);
                 const stream = self.stream;
                 const conn = stream.conn;
-                const arena = stream.arena.allocator();
-                var trailer_nv: std.ArrayList(c.nghttp2_nv) = .empty;
-                if (trailers) |t| {
-                    var it = t.iterator();
-                    while (it.next()) |entry| {
-                        const name = std.ascii.allocLowerString(arena, entry.key) catch return self.fail(error.SystemResources);
-                        trailer_nv.append(arena, field(name, entry.value)) catch return self.fail(error.SystemResources);
-                    }
-                }
+                const trailer_nv = try self.trailerFields(trailers);
                 conn.lock();
                 defer conn.unlock();
-                stream.trailer_nv = trailer_nv.items;
+                stream.trailer_nv = trailer_nv;
                 stream.ended = true;
                 if (stream.out) |*q| {
                     q.close(conn.io);
@@ -1379,7 +1427,9 @@ pub fn Engine(comptime Ctx: type) type {
 
         /// Data provider: takes what the handler queued without waiting.
         /// Empty and not ended defers the stream until the handler resumes
-        /// it; ended sends the end, with the trailers if there are any.
+        /// it; ended sends the end, with the trailers if there are any. The
+        /// end goes on the frame with the last bytes, not on an empty one
+        /// after them.
         fn provideData(
             session: ?*c.nghttp2_session,
             stream_id: i32,
@@ -1393,22 +1443,41 @@ pub fn Engine(comptime Ctx: type) type {
             const stream: *Stream = @ptrCast(@alignCast(source.*.ptr.?));
             if (stream.out) |*q| {
                 const n = q.getUncancelable(conn.io, buf[0..length], 0) catch |err| switch (err) {
-                    error.Closed => return finish(session, stream_id, stream, data_flags),
+                    error.Closed => return finish(session, stream_id, stream, data_flags, 0),
                 };
-                if (n > 0) return @intCast(n);
+                // Once the handler has ended the response nothing more is
+                // put (the queue is closed and nobody waits to put), so an
+                // empty queue is the end of the body.
+                if (n > 0) {
+                    if (stream.ended and q.type_erased.len == 0) return finish(session, stream_id, stream, data_flags, n);
+                    return @intCast(n);
+                }
                 if (!stream.ended) return c.NGHTTP2_ERR_DEFERRED;
+                return finish(session, stream_id, stream, data_flags, 0);
             }
-            return finish(session, stream_id, stream, data_flags);
+            var n: usize = 0;
+            while (n < length and stream.part < stream.parts.len) {
+                const rest = stream.parts[stream.part][stream.part_offset..];
+                const take = @min(rest.len, length - n);
+                @memcpy(buf[n..][0..take], rest[0..take]);
+                n += take;
+                if (take == rest.len) {
+                    stream.part += 1;
+                    stream.part_offset = 0;
+                } else stream.part_offset += take;
+            }
+            if (stream.part < stream.parts.len) return @intCast(n);
+            return finish(session, stream_id, stream, data_flags, n);
         }
 
-        fn finish(session: ?*c.nghttp2_session, stream_id: i32, stream: *Stream, data_flags: [*c]u32) c.nghttp2_ssize {
+        fn finish(session: ?*c.nghttp2_session, stream_id: i32, stream: *Stream, data_flags: [*c]u32, n: usize) c.nghttp2_ssize {
             data_flags.* |= c.NGHTTP2_DATA_FLAG_EOF;
             if (stream.trailer_nv.len > 0) {
                 data_flags.* |= c.NGHTTP2_DATA_FLAG_NO_END_STREAM;
                 if (c.nghttp2_submit_trailer(session, stream_id, stream.trailer_nv.ptr, stream.trailer_nv.len) != 0)
                     return c.NGHTTP2_ERR_CALLBACK_FAILURE;
             }
-            return 0;
+            return @intCast(n);
         }
     };
 }
