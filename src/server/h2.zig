@@ -592,10 +592,14 @@ pub fn Engine(comptime Ctx: type) type {
 
         /// Takes the session's output under the mutex, a frame at a time,
         /// and writes it outside. A frame from `mem_send2` is valid only
-        /// until the next call, so it is copied into `staging` first.
+        /// until the next call, so it is copied straight into the
+        /// connection's write buffer, where it waits for the one write of
+        /// this round. A frame that does not fit there (a full DATA frame,
+        /// or the buffer filled up) goes to `spill`, which the writer frees
+        /// whenever it runs out of output, so an idle connection holds none.
         fn runWriter(conn: *Conn) !void {
-            var staging: std.ArrayList(u8) = .empty;
-            defer staging.deinit(conn.allocator);
+            var spill: std.ArrayList(u8) = .empty;
+            defer spill.deinit(conn.allocator);
             const writer = conn.connection.writer;
             var probed = false;
             while (true) {
@@ -605,18 +609,28 @@ pub fn Engine(comptime Ctx: type) type {
                     conn.lock();
                     defer conn.unlock();
                     closing = conn.closing;
-                    while (staging.items.len < 64 * 1024) {
+                    while (true) {
                         var data: [*c]const u8 = undefined;
                         const n = c.nghttp2_session_mem_send2(conn.session, &data);
                         if (n < 0) return error.Http2ProtocolError;
                         if (n == 0) break;
-                        try staging.appendSlice(conn.allocator, data[0..@intCast(n)]);
+                        const frame = data[0..@intCast(n)];
+                        const room = writer.unusedCapacitySlice();
+                        if (spill.items.len == 0 and frame.len <= room.len) {
+                            @memcpy(room[0..frame.len], frame);
+                            writer.advance(frame.len);
+                            continue;
+                        }
+                        try spill.appendSlice(conn.allocator, frame);
+                        if (spill.items.len >= 64 * 1024) break;
                     }
                 }
-                if (staging.items.len > 0) {
-                    writer.writeAll(staging.items) catch return conn.connection.getWriteError() orelse error.Unexpected;
+                if (writer.end > 0 or spill.items.len > 0) {
+                    if (spill.items.len > 0) {
+                        writer.writeAll(spill.items) catch return conn.connection.getWriteError() orelse error.Unexpected;
+                        spill.clearRetainingCapacity();
+                    }
                     writer.flush() catch return conn.connection.getWriteError() orelse error.Unexpected;
-                    staging.clearRetainingCapacity();
                     // The drain's final GOAWAY is on the wire now.
                     if (@atomicLoad(bool, &conn.drain_flush, .acquire)) {
                         conn.lock();
@@ -650,6 +664,9 @@ pub fn Engine(comptime Ctx: type) type {
                     return;
                 }
                 if (closing and !handlers_running) return;
+                // Nothing to send: the spill's memory goes back while the
+                // connection waits.
+                spill.clearAndFree(conn.allocator);
                 if (closing) {
                     // A peer that closed the whole connection answers the
                     // probe with a TCP reset, so the next write fails;
@@ -974,8 +991,8 @@ pub fn Engine(comptime Ctx: type) type {
                 var trailer_nv: std.ArrayList(c.nghttp2_nv) = .empty;
                 var it = t.iterator();
                 while (it.next()) |entry| {
-                    const name = std.ascii.allocLowerString(arena, entry.key) catch return self.fail(error.SystemResources);
-                    trailer_nv.append(arena, field(name, entry.value)) catch return self.fail(error.SystemResources);
+                    const name = lowerName(arena, entry.key) catch return self.fail(error.SystemResources);
+                    trailer_nv.append(arena, ownedField(name, entry.value, false)) catch return self.fail(error.SystemResources);
                 }
                 return trailer_nv.items;
             }
@@ -1001,26 +1018,31 @@ pub fn Engine(comptime Ctx: type) type {
                 const stream = self.stream;
                 const arena = stream.arena.allocator();
                 stream.status = status;
-                var nv: std.ArrayList(c.nghttp2_nv) = .empty;
-                var status_buf: [3]u8 = undefined;
-                const status_text = std.fmt.bufPrint(&status_buf, "{d}", .{@intFromEnum(status)}) catch unreachable;
-                nv.append(arena, field(":status", arena.dupe(u8, status_text) catch return self.fail(error.SystemResources))) catch return self.fail(error.SystemResources);
+                // Sized once: the status, every header, and a length.
+                const nv = arena.alloc(c.nghttp2_nv, headers.count() + 2) catch return self.fail(error.SystemResources);
+                var count: usize = 0;
+                nv[count] = ownedField(":status", statusText(status), true);
+                count += 1;
                 var has_length = false;
                 var it = headers.iterator();
                 while (it.next()) |entry| {
                     // RFC 9113 §8.2.2: connection-specific fields are malformed.
                     if (isConnectionSpecific(entry.key)) continue;
                     if (std.ascii.eqlIgnoreCase(entry.key, "content-length")) has_length = true;
-                    const name = std.ascii.allocLowerString(arena, entry.key) catch return self.fail(error.SystemResources);
-                    nv.append(arena, field(name, entry.value)) catch return self.fail(error.SystemResources);
+                    const name = lowerName(arena, entry.key) catch return self.fail(error.SystemResources);
+                    // The value may be the handler's, and the head can be
+                    // submitted while the handler runs on: nghttp2 copies it.
+                    nv[count] = ownedField(name, entry.value, false);
+                    count += 1;
                 }
                 if (!has_length and statusHasLength(status)) {
                     if (content_length) |len| {
                         const text = std.fmt.allocPrint(arena, "{d}", .{len}) catch return self.fail(error.SystemResources);
-                        nv.append(arena, field("content-length", text)) catch return self.fail(error.SystemResources);
+                        nv[count] = ownedField("content-length", text, true);
+                        count += 1;
                     }
                 }
-                stream.response_nv = nv.items;
+                stream.response_nv = nv[0..count];
             }
 
             fn interim(ptr: *anyopaque, status: http.Status) std.Io.Writer.Error!void {
@@ -1185,6 +1207,55 @@ pub fn Engine(comptime Ctx: type) type {
                 .valuelen = value.len,
                 .flags = c.NGHTTP2_NV_FLAG_NONE,
             };
+        }
+
+        /// A field whose name is lowercase and lives as long as the stream
+        /// (a literal, or in the stream's arena), so nghttp2 neither copies
+        /// nor lowercases it; the value too, when `value_owned`.
+        fn ownedField(name: []const u8, value: []const u8, value_owned: bool) c.nghttp2_nv {
+            return .{
+                .name = @constCast(name.ptr),
+                .namelen = name.len,
+                .value = @constCast(value.ptr),
+                .valuelen = value.len,
+                .flags = @intCast(c.NGHTTP2_NV_FLAG_NO_COPY_NAME |
+                    if (value_owned) c.NGHTTP2_NV_FLAG_NO_COPY_VALUE else c.NGHTTP2_NV_FLAG_NONE),
+            };
+        }
+
+        /// The common response field names, lowercase, so the usual head
+        /// takes no allocation for its names.
+        const common_names = [_][]const u8{
+            "content-type",                "content-length",            "date",        "server",
+            "vary",                        "cache-control",             "etag",        "last-modified",
+            "content-encoding",            "location",                  "set-cookie",  "x-request-id",
+            "accept-ranges",               "content-range",             "expires",     "alt-svc",
+            "access-control-allow-origin", "strict-transport-security", "grpc-status", "grpc-message",
+            "grpc-encoding",               "content-disposition",       "traceparent", "allow",
+        };
+
+        /// `name` in lowercase: a literal for the common names, else a copy
+        /// in `arena`.
+        fn lowerName(arena: std.mem.Allocator, name: []const u8) ![]const u8 {
+            for (common_names) |known| {
+                if (known.len == name.len and std.ascii.eqlIgnoreCase(known, name)) return known;
+            }
+            return std.ascii.allocLowerString(arena, name);
+        }
+
+        /// The three digits of a status code, as a literal.
+        fn statusText(status: http.Status) []const u8 {
+            const code: usize = @intFromEnum(status);
+            if (code < 100 or code > 999) return "500";
+            const table = comptime blk: {
+                @setEvalBranchQuota(10_000);
+                var t: [900][3]u8 = undefined;
+                for (&t, 100..) |*digits, n| {
+                    digits.* = .{ '0' + n / 100, '0' + n / 10 % 10, '0' + n % 10 };
+                }
+                break :blk t;
+            };
+            return &table[code - 100];
         }
 
         fn isConnectionSpecific(name: []const u8) bool {
