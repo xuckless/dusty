@@ -116,3 +116,89 @@ pub fn currentTask(io: std.Io) ?Task {
 pub fn cancelTask(task: Task) void {
     if (comptime have_task_cancel) task.cancel();
 }
+
+/// zio's executors record the task each one runs.
+const have_current_task = !@hasDecl(zio, "is_stub") and @hasDecl(zio, "Runtime") and
+    @hasDecl(zio.Runtime, "fromIo") and @hasDecl(zio.Runtime, "currentExecutor") and
+    @hasField(zio.Runtime, "executors");
+
+/// A number that tells the calling task from any other task running at the
+/// same time, never 0: who is asking, when a WebSocket decides whether a
+/// send comes from the task that reads it. On zio, the running task; off
+/// it (`std.Io.Threaded`, a thread of zio's blocking pool), the OS thread,
+/// which is the task there.
+pub fn taskId(io: std.Io) usize {
+    if (comptime have_current_task) {
+        if (zio.Runtime.fromIo(io)) |rt| {
+            if (rt.currentExecutor()) |id| {
+                if (rt.executors.items[id].current_task) |task| return @intFromPtr(task);
+            }
+        }
+    }
+    // Thread IDs are small numbers on both Linux and macOS, and task
+    // addresses are not; the top bit keeps the two apart regardless.
+    return @as(usize, @intCast(std.Thread.getCurrentId())) | (@as(usize, 1) << (@bitSizeOf(usize) - 1));
+}
+
+test "taskId: the same task gets the same answer, another task another" {
+    const io = std.testing.io;
+    const mine = taskId(io);
+    try std.testing.expect(mine != 0);
+    try std.testing.expectEqual(mine, taskId(io));
+    var other = try io.concurrent(struct {
+        fn run(i: std.Io) usize {
+            return taskId(i);
+        }
+    }.run, .{io});
+    try std.testing.expect(other.await(io) != mine);
+}
+
+const have_zio_event = !@hasDecl(zio, "is_stub") and @hasDecl(zio, "Event") and
+    @hasDecl(zio, "Runtime") and @hasDecl(zio.Runtime, "fromIo");
+
+/// A flag one task waits on and others set, like `std.Io.Event`. On zio it
+/// is zio's own event, which keeps its waiter inline: `std.Io.Event`'s
+/// futex goes through zio's shared wait table, and a task woken once per
+/// batch of WebSocket messages makes the difference show.
+pub const Signal = struct {
+    std_event: std.Io.Event = .unset,
+    zio_event: if (have_zio_event) zio.Event else void = if (have_zio_event) .init else {},
+
+    pub fn set(self: *Signal, io: std.Io) void {
+        if (comptime have_zio_event) if (zio.Runtime.fromIo(io) != null) return self.zio_event.set();
+        self.std_event.set(io);
+    }
+
+    /// Only by the waiting task, after its wait returned.
+    pub fn reset(self: *Signal, io: std.Io) void {
+        if (comptime have_zio_event) if (zio.Runtime.fromIo(io) != null) return self.zio_event.reset();
+        self.std_event.reset();
+    }
+
+    pub fn wait(self: *Signal, io: std.Io) std.Io.Cancelable!void {
+        if (comptime have_zio_event) if (zio.Runtime.fromIo(io) != null) return self.zio_event.wait() catch |err| switch (err) {
+            error.Canceled => error.Canceled,
+        };
+        return self.std_event.wait(io);
+    }
+};
+
+test "Signal: a set wakes the waiter, and a reset makes it wait again" {
+    const io = std.testing.io;
+    var signal: Signal = .{};
+    var woke: std.atomic.Value(u32) = .init(0);
+    var waiter = try io.concurrent(struct {
+        fn run(s: *Signal, i: std.Io, n: *std.atomic.Value(u32)) std.Io.Cancelable!void {
+            while (true) {
+                try s.wait(i);
+                s.reset(i);
+                _ = n.fetchAdd(1, .release);
+            }
+        }
+    }.run, .{ &signal, io, &woke });
+    signal.set(io);
+    while (woke.load(.acquire) == 0) try io.sleep(.fromMilliseconds(1), .awake);
+    signal.set(io);
+    while (woke.load(.acquire) < 2) try io.sleep(.fromMilliseconds(1), .awake);
+    try std.testing.expectError(error.Canceled, waiter.cancel(io));
+}

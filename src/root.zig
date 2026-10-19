@@ -30,6 +30,9 @@ pub const RequestBodyReader = @import("parser.zig").RequestBodyReader;
 pub const EventStream = @import("response.zig").EventStream;
 pub const EventWriter = @import("response.zig").EventWriter;
 pub const WebSocket = @import("websocket.zig").WebSocket;
+/// How a WebSocket sends once per read (`WebSocket`); for layers that
+/// frame WebSocket messages themselves.
+pub const WebSocketBatch = @import("websocket.zig").Batch;
 pub const Method = @import("http.zig").Method;
 pub const Status = @import("http.zig").Status;
 pub const Headers = @import("http.zig").Headers;
@@ -100,6 +103,7 @@ comptime {
     _ = @import("middleware.zig");
     _ = @import("middleware/middleware.zig");
     _ = @import("locals.zig");
+    _ = @import("placement.zig");
     _ = @import("api_test.zig");
     _ = @import("proxy_protocol.zig");
     _ = @import("fuzz.zig");
