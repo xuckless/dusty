@@ -255,9 +255,9 @@ pub const ServerConfig = struct {
     /// `Listener.kernel_backlog` deep. Null lifts the cap.
     ///
     /// An open connection costs about 2K, 33K more under TLS, and
-    /// `request.buffer_size + response.write_buffer_size + 9K` more once
-    /// its first request arrives, or only while a request is being served
-    /// with `request.keep_buffers_between_requests` off. A request with a body
+    /// `request.buffer_size + response.write_buffer_size + 9K` more while a
+    /// request is being served, or for as long as it is open with
+    /// `request.keep_buffers_between_requests` on. A request with a body
     /// with a `Content-Encoding` takes 70K more while `request.decompress`
     /// is on.
     max_connections: ?u32 = 10_000,
@@ -406,11 +406,13 @@ pub const ServerConfig = struct {
         buffer_size: usize = 16384,
         /// Whether a keep-alive connection keeps the buffer its requests
         /// are read into, and their arena, while it waits for the next one.
-        /// Off, it gives them back between requests and takes a set again
-        /// when the next one arrives: an idle connection then holds only
-        /// its own 2K, but every request on a busy one pays for the trip,
-        /// which costs throughput on a server with many cores.
-        keep_buffers_between_requests: bool = true,
+        /// Off (the default), it gives them back between requests and takes
+        /// a set again when the next one arrives: an idle connection then
+        /// holds only its own 2K rather than every page its requests
+        /// dirtied in the set. Under zio the trip is to a free list of the
+        /// executor's own, with no lock; elsewhere it takes a sharded lock,
+        /// which on a server with many cores costs some throughput.
+        keep_buffers_between_requests: bool = false,
         /// Maximum number of headers allowed in a request
         max_header_count: usize = 32,
         /// Maximum number of route parameters (e.g., /user/:id/:action)

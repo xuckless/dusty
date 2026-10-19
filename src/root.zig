@@ -16,6 +16,7 @@ pub const Sink = @import("sink.zig").Sink;
 /// Task placement on zio's executors, for protocol engines outside dusty
 /// (HTTP/3) that keep a connection's tasks on one executor.
 pub const placement = @import("placement.zig");
+pub const DrainHooks = @import("drain_hooks.zig").DrainHooks;
 /// One time budget shared by several blocking calls (a request, then the
 /// reads of its body), as the client's `timeout` is; for protocol clients
 /// outside dusty (HTTP/2, HTTP/3).
@@ -88,6 +89,7 @@ test {
 comptime {
     _ = @import("server_test.zig");
     _ = @import("server/request_buffers.zig");
+    _ = @import("drain_hooks.zig");
     _ = @import("websocket.zig");
     _ = @import("client.zig");
     _ = @import("client_test.zig");

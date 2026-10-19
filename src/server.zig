@@ -27,6 +27,7 @@ const have_auto_cancel = @import("deadline.zig").have_auto_cancel;
 const Watch = @import("deadline.zig").Watch;
 const Timer = @import("deadline.zig").Timer;
 const placement = @import("placement.zig");
+const DrainHooks = @import("drain_hooks.zig").DrainHooks;
 /// The HTTP/2 engine, with the `use_http2` build option.
 const proxy_protocol = @import("proxy_protocol.zig");
 const h2 = if (build_options.use_http2) @import("server/h2.zig") else struct {};
@@ -307,7 +308,7 @@ pub const Connection = struct {
         self.writer = &self.tcp_writer.interface;
     }
 
-    pub fn initTls(
+    pub noinline fn initTls(
         self: *Connection,
         allocator: std.mem.Allocator,
         io: std.Io,
@@ -403,6 +404,68 @@ pub const Connection = struct {
         // default rebase, which is a move within the buffer and cannot
         // fail.
         r.rebase(r.buffer.len) catch unreachable;
+    }
+
+    /// Smallest reader and writer windows `shrinkForUpgrade` leaves. A frame
+    /// bigger than its window still goes through in one call: a read that
+    /// big lands straight in the caller's slice, and a write goes out with
+    /// what the window holds in one vectored write.
+    pub const upgrade_window_min = 1024;
+
+    /// For a connection the request upgraded (a WebSocket): it lives on as
+    /// long as the peer keeps it open, mostly idle, with the request's
+    /// buffers still under it, because the head the handler may still read
+    /// (its URL, headers and parameters) is in them. So the reader and the
+    /// writer move to small windows just past the head, and the rest of the
+    /// buffers' pages go back to the OS (Linux, `MADV_DONTNEED`): the socket
+    /// keeps the pages the head and the windows touch, rather than every
+    /// page of the set a bigger request, here or earlier, dirtied. The
+    /// windows reach to the end of the page the minimums end in, so that
+    /// page is used whole. What the peer already sent past the head stays
+    /// buffered. Before anything is written to the connection after the
+    /// head was read, so the 101 goes through the new window.
+    pub fn shrinkForUpgrade(self: *Connection) void {
+        const r = self.reader;
+        const w = self.writer;
+        // Not reading from the pooled buffer (a test's fixed reader), or
+        // the writer holds something already.
+        if (self.read_buffer.len == 0 or w.end != 0) return;
+        const read_end = @intFromPtr(self.read_buffer.ptr) + self.read_buffer.len;
+        if (@intFromPtr(r.buffer.ptr) < @intFromPtr(self.read_buffer.ptr) or @intFromPtr(r.buffer.ptr) + r.buffer.len != read_end) return;
+
+        // What is buffered past the head, to the front of the reader's view.
+        const buffered_len = r.end - r.seek;
+        std.mem.copyForwards(u8, r.buffer[0..buffered_len], r.buffer[r.seek..r.end]);
+        r.seek = 0;
+        r.end = buffered_len;
+        const room = r.buffer;
+
+        const start = @intFromPtr(room.ptr);
+        const page = std.heap.pageSize();
+        const min_read = @max(buffered_len, upgrade_window_min);
+        const end = std.mem.alignForward(usize, start + min_read + upgrade_window_min, page);
+        const span = end - start;
+        if (span > room.len) {
+            // No room for both: the reader keeps its view, the writer a
+            // window of its own buffer.
+            w.buffer = w.buffer[0..@min(w.buffer.len, @max(upgrade_window_min, page))];
+            return;
+        }
+        const read_len = @max(min_read, span / 2);
+        r.buffer = room[0..read_len];
+        const old_write = w.buffer;
+        w.buffer = room[read_len..span];
+
+        // Give back the pages past the windows: the rest of the read buffer
+        // and, where it follows it in the same allocation (the pool's
+        // sets), the write buffer.
+        if (comptime builtin.os.tag != .linux) return;
+        var release_end = read_end;
+        if (@intFromPtr(old_write.ptr) == read_end) release_end += old_write.len;
+        const from = std.mem.alignForward(usize, end, page);
+        const to = std.mem.alignBackward(usize, release_end, page);
+        if (to <= from) return;
+        _ = std.os.linux.madvise(@ptrFromInt(from), to - from, std.os.linux.MADV.DONTNEED);
     }
 
     /// For tests: wraps a bare writer with no real TLS/TCP layer behind it.
@@ -673,6 +736,8 @@ pub fn Server(comptime Ctx: type) type {
         /// `Request.drain`, to finish early rather than be cut off at
         /// `timeout.shutdown`.
         draining: std.Io.Event = .unset,
+        /// Run when `draining` is set: see `Request.drain_hooks`.
+        drain_hooks: DrainHooks = .{},
         /// Set with `ready`, or when `run` stops before it is listening,
         /// with `start_error` saying why.
         settled: std.Io.Event = .unset,
@@ -898,6 +963,7 @@ pub fn Server(comptime Ctx: type) type {
             defer {
                 _ = self.busy.fetchOr(.{ .draining = true }, .release);
                 self.draining.set(self.io);
+                self.drain_hooks.fire(self.io);
                 connections.cancel(self.io);
             }
 
@@ -1244,6 +1310,7 @@ pub fn Server(comptime Ctx: type) type {
             log.info("Graceful shutdown requested", .{});
             _ = self.busy.fetchOr(.{ .draining = true }, .acq_rel);
             self.draining.set(self.io);
+            self.drain_hooks.fire(self.io);
 
             // HTTP/2 connections get a two-phase GOAWAY (RFC 9113 §6.8): a
             // notice now, the final one a round trip later, when the PING
@@ -1472,7 +1539,7 @@ pub fn Server(comptime Ctx: type) type {
         ///
         /// Throwing input away needs no request buffers, so the set is given
         /// back first and the reads go through `idle_read_buffer`.
-        fn lingeringClose(
+        noinline fn lingeringClose(
             self: *Self,
             connection: *Connection,
             timer: *Timer,
@@ -1520,7 +1587,7 @@ pub fn Server(comptime Ctx: type) type {
         /// the send side and read what the client still sends, until it
         /// hangs up, `linger_timeout`, or `linger_limit` bytes. Skipped
         /// where the timer cannot bound the reads.
-        fn lingerAfterRefusal(self: *Self, stream: std.Io.net.Stream, timer: *Timer) void {
+        noinline fn lingerAfterRefusal(self: *Self, stream: std.Io.net.Stream, timer: *Timer) void {
             if (!timer.canBound()) return;
             stream.shutdown(self.io, .send) catch return;
             timer.set(self.io, .{ .duration = .{ .raw = linger_timeout, .clock = .awake } });
@@ -1735,6 +1802,27 @@ pub fn Server(comptime Ctx: type) type {
             try executor.run();
         }
 
+        /// Throws away the rest of a request body the handler left unread,
+        /// up to `max` bytes: whether the connection can carry on. On a
+        /// frame of its own, so the scratch buffer is not part of the
+        /// request loop's frame, under every handler, for the life of the
+        /// connection (an upgraded one's included).
+        noinline fn discardBody(parser: *RequestParser, connection: *Connection, max: usize) error{Canceled}!bool {
+            var scratch: [4096]u8 = undefined;
+            // No decoding: this is throwing the body away to get back to the
+            // connection, and `max` bounds what the peer sent rather than
+            // what it would decode to.
+            var body_reader = RequestBodyReader.init(parser, connection.transport(), &scratch);
+            if (body_reader.interface.discardShort(max + 1)) |consumed| {
+                return consumed <= max;
+            } else |_| {
+                // A cancel is the request timing out, not a body worth
+                // giving up on quietly.
+                if (body_reader.err) |e| if (e == error.Canceled) return error.Canceled;
+                return false;
+            }
+        }
+
         /// Runs the HTTP request loop over a connection: each request is
         /// parsed, served and answered before the next is looked at, so
         /// pipelined requests are answered in order without any more
@@ -1766,6 +1854,7 @@ pub fn Server(comptime Ctx: type) type {
                 .listener = l.config,
                 .secure = (build_options.use_tls and l.config.tls != null) or connection.proxied_secure,
                 .drain = &self.draining,
+                .drain_hooks = &self.drain_hooks,
                 .peer_certificate = connection.peerCertificate(),
                 ._timeout_context = timer,
                 ._set_timeout = setRequestTimeout,
@@ -2014,19 +2103,7 @@ pub fn Server(comptime Ctx: type) type {
                         break :blk n <= max;
                     };
                     if (drainable) {
-                        var scratch: [4096]u8 = undefined;
-                        // No decoding: this is throwing the body away to get
-                        // back to the connection, and `max` bounds what the
-                        // peer sent rather than what it would decode to.
-                        var body_reader = RequestBodyReader.init(&parser, connection.transport(), &scratch);
-                        if (body_reader.interface.discardShort(max + 1)) |consumed| {
-                            if (consumed > max) response.keepalive = false;
-                        } else |_| {
-                            // A cancel is the request timing out, not a body
-                            // worth giving up on quietly.
-                            if (body_reader.err) |e| if (e == error.Canceled) return error.Canceled;
-                            response.keepalive = false;
-                        }
+                        if (!try discardBody(&parser, connection, max)) response.keepalive = false;
                     } else {
                         response.keepalive = false;
                     }

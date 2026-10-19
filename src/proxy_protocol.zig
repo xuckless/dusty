@@ -168,7 +168,7 @@ pub const ReadError = Error || std.Io.net.Stream.Reader.Error || error{EndOfStre
 /// Reads a PROXY header, v1 or v2, off `stream` and parses it. Reads only
 /// the header's bytes. A connection that does not start with one is an
 /// `InvalidProxyHeader`.
-pub fn read(io: std.Io, stream: std.Io.net.Stream) ReadError!Header {
+pub noinline fn read(io: std.Io, stream: std.Io.net.Stream) ReadError!Header {
     // 12 bytes tell v2 from v1, and every v1 header is longer than that
     // ("PROXY UNKNOWN\r\n" is 15).
     var start: [16]u8 = undefined;

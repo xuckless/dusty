@@ -748,6 +748,7 @@ pub fn Engine(comptime Ctx: type) type {
                 .version_major = 2,
                 .version_minor = 0,
                 .drain = &server.draining,
+                .drain_hooks = &server.drain_hooks,
                 ._timeout_context = &timer,
                 ._set_timeout = setTimeout,
             };

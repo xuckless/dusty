@@ -1,9 +1,13 @@
 //! The memory requests are served with -- the buffer a head is read into
-//! and the arena everything else comes from -- in sets that closed
-//! connections hand on to new ones. The free sets are sharded so that
-//! connections opening and closing at once mostly take different locks.
+//! and the arena everything else comes from -- in sets that requests hand
+//! on to the next. Under zio each executor keeps the sets given back on it
+//! and takes from them first, with no lock: a connection stays on its
+//! executor, so the set it gives back is the one it takes for its next
+//! request. Elsewhere the free sets are sharded, so that connections
+//! opening and closing at once mostly take different locks.
 
 const std = @import("std");
+const placement = @import("../placement.zig");
 
 /// A request's read and write buffers and arena, in one allocation with
 /// this header.
@@ -25,8 +29,20 @@ pub const RequestBuffersPool = struct {
     /// growing it.
     arena_reserve: usize,
     shards: [shard_count]Shard = @splat(.{}),
+    /// One free list per executor, by index (zio has at most 64). Only the
+    /// executor's own thread touches its list, and nothing between taking
+    /// a set off and putting one on can suspend, so it needs no lock.
+    locals: [max_executors]Local = @splat(.{}),
 
     const shard_count = 16;
+    const max_executors = 64;
+    /// `RequestBuffers.shard` for a set from an executor's list.
+    const local_shard = shard_count;
+
+    const Local = struct {
+        free: std.SinglyLinkedList = .{},
+        _: void align(std.atomic.cache_line) = {},
+    };
 
     const Shard = struct {
         mutex: std.Io.Mutex = .init,
@@ -50,6 +66,9 @@ pub const RequestBuffersPool = struct {
         for (&self.shards) |*shard| {
             while (shard.free.popFirst()) |node| self.destroy(@fieldParentPtr("node", node));
         }
+        for (&self.locals) |*list| {
+            while (list.free.popFirst()) |node| self.destroy(@fieldParentPtr("node", node));
+        }
         self.* = undefined;
     }
 
@@ -57,6 +76,11 @@ pub const RequestBuffersPool = struct {
     /// The caller passes the same key for the same connection, its address
     /// say, so the sets it gives back are the ones it takes again.
     pub fn acquire(self: *RequestBuffersPool, key: usize) std.mem.Allocator.Error!*RequestBuffers {
+        if (self.local()) |list| {
+            const buffers: *RequestBuffers = if (list.free.popFirst()) |n| @fieldParentPtr("node", n) else try self.create();
+            buffers.shard = local_shard;
+            return buffers;
+        }
         const index: u8 = @intCast(std.hash.int(key) % shard_count);
         const shard = &self.shards[index];
         const node = blk: {
@@ -72,10 +96,23 @@ pub const RequestBuffersPool = struct {
     /// Gives a set back to the shard it was taken from, its arena reset.
     pub fn release(self: *RequestBuffersPool, buffers: *RequestBuffers) void {
         _ = buffers.arena.reset(.retain_capacity);
+        if (self.local()) |list| {
+            list.free.prepend(&buffers.node);
+            return;
+        }
+        // Taken from an executor's list, given back off one: any shard.
+        if (buffers.shard == local_shard) buffers.shard = @intCast(std.hash.int(@intFromPtr(buffers)) % shard_count);
         const shard = &self.shards[buffers.shard];
         shard.mutex.lockUncancelable(self.io);
         defer shard.mutex.unlock(self.io);
         shard.free.prepend(&buffers.node);
+    }
+
+    /// The calling executor's free list, under zio.
+    fn local(self: *RequestBuffersPool) ?*Local {
+        const i = placement.currentExecutor(self.io) orelse return null;
+        if (i >= max_executors) return null;
+        return &self.locals[i];
     }
 
     fn create(self: *RequestBuffersPool) std.mem.Allocator.Error!*RequestBuffers {
