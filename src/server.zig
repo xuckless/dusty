@@ -308,7 +308,7 @@ pub const Connection = struct {
         self.writer = &self.tcp_writer.interface;
     }
 
-    pub fn initTls(
+    pub noinline fn initTls(
         self: *Connection,
         allocator: std.mem.Allocator,
         io: std.Io,
@@ -1539,7 +1539,7 @@ pub fn Server(comptime Ctx: type) type {
         ///
         /// Throwing input away needs no request buffers, so the set is given
         /// back first and the reads go through `idle_read_buffer`.
-        fn lingeringClose(
+        noinline fn lingeringClose(
             self: *Self,
             connection: *Connection,
             timer: *Timer,
@@ -1587,7 +1587,7 @@ pub fn Server(comptime Ctx: type) type {
         /// the send side and read what the client still sends, until it
         /// hangs up, `linger_timeout`, or `linger_limit` bytes. Skipped
         /// where the timer cannot bound the reads.
-        fn lingerAfterRefusal(self: *Self, stream: std.Io.net.Stream, timer: *Timer) void {
+        noinline fn lingerAfterRefusal(self: *Self, stream: std.Io.net.Stream, timer: *Timer) void {
             if (!timer.canBound()) return;
             stream.shutdown(self.io, .send) catch return;
             timer.set(self.io, .{ .duration = .{ .raw = linger_timeout, .clock = .awake } });
@@ -1800,6 +1800,27 @@ pub fn Server(comptime Ctx: type) type {
                 .error_handler = self.config.error_handler,
             };
             try executor.run();
+        }
+
+        /// Throws away the rest of a request body the handler left unread,
+        /// up to `max` bytes: whether the connection can carry on. On a
+        /// frame of its own, so the scratch buffer is not part of the
+        /// request loop's frame, under every handler, for the life of the
+        /// connection (an upgraded one's included).
+        noinline fn discardBody(parser: *RequestParser, connection: *Connection, max: usize) error{Canceled}!bool {
+            var scratch: [4096]u8 = undefined;
+            // No decoding: this is throwing the body away to get back to the
+            // connection, and `max` bounds what the peer sent rather than
+            // what it would decode to.
+            var body_reader = RequestBodyReader.init(parser, connection.transport(), &scratch);
+            if (body_reader.interface.discardShort(max + 1)) |consumed| {
+                return consumed <= max;
+            } else |_| {
+                // A cancel is the request timing out, not a body worth
+                // giving up on quietly.
+                if (body_reader.err) |e| if (e == error.Canceled) return error.Canceled;
+                return false;
+            }
         }
 
         /// Runs the HTTP request loop over a connection: each request is
@@ -2082,19 +2103,7 @@ pub fn Server(comptime Ctx: type) type {
                         break :blk n <= max;
                     };
                     if (drainable) {
-                        var scratch: [4096]u8 = undefined;
-                        // No decoding: this is throwing the body away to get
-                        // back to the connection, and `max` bounds what the
-                        // peer sent rather than what it would decode to.
-                        var body_reader = RequestBodyReader.init(&parser, connection.transport(), &scratch);
-                        if (body_reader.interface.discardShort(max + 1)) |consumed| {
-                            if (consumed > max) response.keepalive = false;
-                        } else |_| {
-                            // A cancel is the request timing out, not a body
-                            // worth giving up on quietly.
-                            if (body_reader.err) |e| if (e == error.Canceled) return error.Canceled;
-                            response.keepalive = false;
-                        }
+                        if (!try discardBody(&parser, connection, max)) response.keepalive = false;
                     } else {
                         response.keepalive = false;
                     }
