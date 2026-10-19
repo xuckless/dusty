@@ -145,6 +145,18 @@ const TestClient = struct {
         return self.responses.get(id).?;
     }
 
+    /// Sends what the session has, without waiting for anything.
+    fn sendPending(self: *TestClient) !void {
+        while (true) {
+            var data: [*c]const u8 = undefined;
+            const n = c.nghttp2_session_mem_send2(self.session, &data);
+            if (n < 0) return error.Http2Send;
+            if (n == 0) break;
+            try self.w.writeAll(data[0..@intCast(n)]);
+        }
+        try self.w.flush();
+    }
+
     /// Sends and receives until every submitted stream is closed.
     fn run(self: *TestClient) !void {
         while (true) {
@@ -305,6 +317,10 @@ const Handlers = struct {
     /// answers with its length and a checksum.
     fn late(req: *dusty.Request, res: *dusty.Response) !void {
         try req.io.sleep(.fromMilliseconds(100), .awake);
+        return sum(req, res);
+    }
+    /// The body's length and checksum.
+    fn sum(req: *dusty.Request, res: *dusty.Response) !void {
         var in_buf: [4096]u8 = undefined;
         var body = try req.reader(&in_buf);
         var hash: std.hash.Wyhash = .init(0);
@@ -345,6 +361,7 @@ const Fixture = struct {
         self.server.router.addRouteWith(.get, "/nw/big", Handlers.big, .{ .no_wait = true });
         self.server.router.addRouteWith(.post, "/nw/echo", Handlers.echo, .{ .no_wait = true });
         self.server.router.addRouteWith(.get, "/nw/slow", Handlers.slow, .{ .no_wait = true });
+        self.server.router.addRouteWith(.post, "/nw/sum", Handlers.sum, .{ .no_wait = true });
         self.future = try io.concurrent(run, .{&self.server});
         try self.server.waitReady(io);
     }
@@ -446,6 +463,41 @@ test "HTTP/2: no_wait routes answer from the reader, beside tasks, past the wind
     try std.testing.expectEqualStrings("5", client.get(head).content_length.?);
     try std.testing.expectEqualStrings("", client.get(head).body.items);
     try std.testing.expectEqualStrings("hello", client.get(query).body.items);
+}
+
+test "HTTP/2: a no_wait request with a body runs inline when it came whole, else on a task" {
+    const io = std.testing.io;
+    var fx: Fixture = undefined;
+    try fx.start(io);
+    defer fx.stop(io);
+
+    const body = try std.testing.allocator.alloc(u8, 2 * 1024 * 1024 + 5);
+    defer std.testing.allocator.free(body);
+    for (body, 0..) |*b, i| b.* = @truncate(i *% 77 +% (i >> 13));
+
+    var client: TestClient = undefined;
+    try client.init(std.testing.allocator, io, fx.server.address.ip);
+    defer client.deinit();
+    var ids: [8]i32 = undefined;
+    for (&ids, 0..) |*id, i| id.* = try client.request("POST", "/nw/sum", body[0 .. i * 100]);
+    // Past the stream window: it cannot come whole before someone reads.
+    const big = try client.request("POST", "/nw/sum", body);
+    try client.run();
+    var expect: [64]u8 = undefined;
+    for (ids, 0..) |id, i| {
+        try std.testing.expectEqualStrings(try std.fmt.bufPrint(&expect, "{d} {x}", .{ i * 100, std.hash.Wyhash.hash(0, body[0 .. i * 100]) }), client.get(id).body.items);
+    }
+    try std.testing.expectEqualStrings(try std.fmt.bufPrint(&expect, "{d} {x}", .{ body.len, std.hash.Wyhash.hash(0, body) }), client.get(big).body.items);
+
+    // Reset with its body half sent: let go, and the connection carries on.
+    const cut = try client.request("POST", "/nw/sum", body[0..1000]);
+    client.get(cut).keep_open = true;
+    try client.sendPending();
+    try io.sleep(.fromMilliseconds(50), .awake);
+    _ = c.nghttp2_submit_rst_stream(client.session, c.NGHTTP2_FLAG_NONE, cut, c.NGHTTP2_CANCEL);
+    const after = try client.request("POST", "/nw/sum", body[0..10]);
+    try client.run();
+    try std.testing.expectEqualStrings(try std.fmt.bufPrint(&expect, "{d} {x}", .{ 10, std.hash.Wyhash.hash(0, body[0..10]) }), client.get(after).body.items);
 }
 
 test "HTTP/2: a no_wait handler that waits anyway still answers, holding up its connection" {

@@ -176,6 +176,11 @@ pub fn Engine(comptime Ctx: type) type {
             /// reader to run once the session has taken the read. Only the
             /// reader touches it.
             ready: std.ArrayList(*Stream) = .empty,
+            /// Requests of `no_wait` routes whose body is still coming: if
+            /// it ends within the same read they run inline too, else they
+            /// get a task once the session has taken the read, so a body is
+            /// never held back waiting for a handler that is not reading it.
+            awaiting: std.ArrayList(*Stream) = .empty,
             /// The server has `no_wait` routes and runs them inline.
             inline_ok: bool = false,
             /// The reader is done; the writer sends what is left and exits.
@@ -339,6 +344,9 @@ pub fn Engine(comptime Ctx: type) type {
             status: http.Status = .ok,
             response_nv: []c.nghttp2_nv = &.{},
             submitted: bool = false,
+            /// A `no_wait` route's request with its body still coming, in
+            /// `Conn.awaiting`.
+            await_body: bool = false,
             /// The handler runs on the connection's reader (a `no_wait`
             /// route), which must never wait for the writer: its body goes
             /// to `backlog`, which grows as needed, instead of the queue.
@@ -493,6 +501,7 @@ pub fn Engine(comptime Ctx: type) type {
                 .inline_ok = server.config.http2.inline_no_wait and server.router.has_no_wait,
             };
             defer conn.ready.deinit(conn.allocator);
+            defer conn.awaiting.deinit(conn.allocator);
             try conn.initSession();
             server.h2_conns.add(&conn);
             defer {
@@ -582,6 +591,7 @@ pub fn Engine(comptime Ctx: type) type {
                         conn.group = group;
                         defer conn.group = null;
                         const rv = c.nghttp2_session_mem_recv2(conn.session, buffered.ptr, buffered.len);
+                        if (conn.awaiting.items.len > 0) startAwaiting(conn);
                         if (rv < 0) {
                             log.debug("HTTP/2 session: {s}", .{c.nghttp2_strerror(@intCast(rv))});
                             // nghttp2 queued a GOAWAY for a protocol error;
@@ -1471,14 +1481,22 @@ pub fn Engine(comptime Ctx: type) type {
                 c.NGHTTP2_HEADERS => {
                     if (frame.*.headers.cat == c.NGHTTP2_HCAT_REQUEST) {
                         if (end_stream) stream.closeBody();
-                        if (end_stream and conn.inline_ok and noWaitRoute(conn, stream)) {
-                            queueInline(conn, stream);
+                        if (conn.inline_ok and noWaitRoute(conn, stream)) {
+                            if (end_stream) {
+                                queueInline(conn, stream);
+                            } else if (conn.awaiting.append(conn.allocator, stream)) |_| {
+                                stream.await_body = true;
+                            } else |_| startStream(conn, stream);
                         } else startStream(conn, stream);
                     } else if (end_stream) {
                         stream.closeBody(); // trailers end the body
+                        bodyEnded(conn, stream);
                     }
                 },
-                c.NGHTTP2_DATA => if (end_stream) stream.closeBody(),
+                c.NGHTTP2_DATA => if (end_stream) {
+                    stream.closeBody();
+                    bodyEnded(conn, stream);
+                },
                 else => {},
             }
             conn.kickWriter(); // also wakes a body reader waiting for its queue
@@ -1518,6 +1536,30 @@ pub fn Engine(comptime Ctx: type) type {
             conn.open_streams += 1;
             stream.counted = true;
             stream.inline_mode = true;
+        }
+
+        /// The body of a request set aside in `awaiting` is whole: it runs
+        /// inline after all.
+        fn bodyEnded(conn: *Conn, stream: *Stream) void {
+            if (!stream.await_body) return;
+            stream.await_body = false;
+            queueInline(conn, stream);
+        }
+
+        /// After a read: the `no_wait` requests whose body did not end in
+        /// it get a task, as any other request; one reset meanwhile is let
+        /// go. Under the mutex, with the group set.
+        fn startAwaiting(conn: *Conn) void {
+            defer conn.awaiting.clearRetainingCapacity();
+            for (conn.awaiting.items) |stream| {
+                if (!stream.await_body) continue;
+                stream.await_body = false;
+                if (stream.reset) {
+                    stream.release(.handler);
+                    continue;
+                }
+                startStream(conn, stream);
+            }
         }
 
         /// Notes when the frame that ends a response is out. If the handler
