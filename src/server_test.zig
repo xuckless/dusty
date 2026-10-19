@@ -318,6 +318,84 @@ test "Server: a streamed body to an HTTP/1.0 client is not chunked" {
     try std.testing.expect(std.mem.endsWith(u8, raw, "\r\n\r\nhello world"));
 }
 
+test "Server: an upgraded connection keeps what came with the handshake, and its head" {
+    const io = std.testing.io;
+    const big_len = 10_000;
+
+    const TestContext = struct {
+        const Self = @This();
+        url_ok: bool = false,
+        echoed: bool = false,
+
+        fn handle(ctx: *Self, req: *dusty.Request, res: *dusty.Response) !void {
+            var ws = try res.upgradeWebSocket(req) orelse {
+                res.status = .bad_request;
+                return;
+            };
+            defer ws.deinit();
+            // Bigger than the windows the reader and writer shrank to.
+            const msg = try ws.receive();
+            try std.testing.expectEqual(big_len, msg.data.len);
+            for (msg.data, 0..) |b, i| try std.testing.expectEqual(@as(u8, @truncate(i)), b);
+            try ws.send(.binary, msg.data);
+            // The request's head is still there after the upgrade.
+            ctx.url_ok = std.mem.eql(u8, req.url, "/ws?room=a") and
+                std.mem.eql(u8, req.headers.get("X-Tag") orelse "", "kept");
+            @atomicStore(bool, &ctx.echoed, true, .release);
+        }
+    };
+
+    var ctx: TestContext = .{};
+    var server = dusty.Server(TestContext).init(std.testing.allocator, io, .{ .listeners = loopback }, &ctx);
+    defer server.deinit();
+    server.router.get("/ws", TestContext.handle);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(TestContext)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    try server.waitReady(io);
+    const stream = try server.address.ip.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+
+    // The handshake and a masked 10 000-byte frame in one write.
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(std.testing.allocator);
+    const a = std.testing.allocator;
+    try out.appendSlice(a, "GET /ws?room=a HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" ++
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nX-Tag: kept\r\n\r\n");
+    const mask = [4]u8{ 0x11, 0x22, 0x33, 0x44 };
+    try out.appendSlice(a, &.{ 0x82, 0x80 | 126, big_len >> 8, big_len & 0xff });
+    try out.appendSlice(a, &mask);
+    for (0..big_len) |i| try out.append(a, @as(u8, @truncate(i)) ^ mask[i % 4]);
+    var write_buf: [256]u8 = undefined;
+    var writer = stream.writer(io, &write_buf);
+    try writer.interface.writeAll(out.items);
+    try writer.interface.flush();
+
+    var read_buf: [16384]u8 = undefined;
+    var reader = stream.reader(io, &read_buf);
+    const r = &reader.interface;
+    const head = try r.takeDelimiterInclusive('\n');
+    try std.testing.expect(std.mem.indexOf(u8, head, "101") != null);
+    while (true) {
+        const line = try r.takeDelimiterInclusive('\n');
+        if (std.mem.eql(u8, line, "\r\n")) break;
+    }
+    const frame_head = try r.takeArray(4);
+    try std.testing.expectEqual(0x82, frame_head[0]);
+    try std.testing.expectEqual(126, frame_head[1]);
+    try std.testing.expectEqual(big_len, std.mem.readInt(u16, frame_head[2..4], .big));
+    const body = try r.take(big_len);
+    for (body, 0..) |b, i| try std.testing.expectEqual(@as(u8, @truncate(i)), b);
+    // The handler checks the head after the echo, so wait for it.
+    while (!@atomicLoad(bool, &ctx.echoed, .acquire)) try io.sleep(.fromMilliseconds(1), .awake);
+    try std.testing.expect(ctx.url_ok);
+}
+
 test "Server: WebSocket echo" {
     const io = std.testing.io;
 

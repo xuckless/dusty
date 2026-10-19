@@ -406,6 +406,68 @@ pub const Connection = struct {
         r.rebase(r.buffer.len) catch unreachable;
     }
 
+    /// Smallest reader and writer windows `shrinkForUpgrade` leaves. A frame
+    /// bigger than its window still goes through in one call: a read that
+    /// big lands straight in the caller's slice, and a write goes out with
+    /// what the window holds in one vectored write.
+    pub const upgrade_window_min = 1024;
+
+    /// For a connection the request upgraded (a WebSocket): it lives on as
+    /// long as the peer keeps it open, mostly idle, with the request's
+    /// buffers still under it, because the head the handler may still read
+    /// (its URL, headers and parameters) is in them. So the reader and the
+    /// writer move to small windows just past the head, and the rest of the
+    /// buffers' pages go back to the OS (Linux, `MADV_DONTNEED`): the socket
+    /// keeps the pages the head and the windows touch, rather than every
+    /// page of the set a bigger request, here or earlier, dirtied. The
+    /// windows reach to the end of the page the minimums end in, so that
+    /// page is used whole. What the peer already sent past the head stays
+    /// buffered. Before anything is written to the connection after the
+    /// head was read, so the 101 goes through the new window.
+    pub fn shrinkForUpgrade(self: *Connection) void {
+        const r = self.reader;
+        const w = self.writer;
+        // Not reading from the pooled buffer (a test's fixed reader), or
+        // the writer holds something already.
+        if (self.read_buffer.len == 0 or w.end != 0) return;
+        const read_end = @intFromPtr(self.read_buffer.ptr) + self.read_buffer.len;
+        if (@intFromPtr(r.buffer.ptr) < @intFromPtr(self.read_buffer.ptr) or @intFromPtr(r.buffer.ptr) + r.buffer.len != read_end) return;
+
+        // What is buffered past the head, to the front of the reader's view.
+        const buffered_len = r.end - r.seek;
+        std.mem.copyForwards(u8, r.buffer[0..buffered_len], r.buffer[r.seek..r.end]);
+        r.seek = 0;
+        r.end = buffered_len;
+        const room = r.buffer;
+
+        const start = @intFromPtr(room.ptr);
+        const page = std.heap.pageSize();
+        const min_read = @max(buffered_len, upgrade_window_min);
+        const end = std.mem.alignForward(usize, start + min_read + upgrade_window_min, page);
+        const span = end - start;
+        if (span > room.len) {
+            // No room for both: the reader keeps its view, the writer a
+            // window of its own buffer.
+            w.buffer = w.buffer[0..@min(w.buffer.len, @max(upgrade_window_min, page))];
+            return;
+        }
+        const read_len = @max(min_read, span / 2);
+        r.buffer = room[0..read_len];
+        const old_write = w.buffer;
+        w.buffer = room[read_len..span];
+
+        // Give back the pages past the windows: the rest of the read buffer
+        // and, where it follows it in the same allocation (the pool's
+        // sets), the write buffer.
+        if (comptime builtin.os.tag != .linux) return;
+        var release_end = read_end;
+        if (@intFromPtr(old_write.ptr) == read_end) release_end += old_write.len;
+        const from = std.mem.alignForward(usize, end, page);
+        const to = std.mem.alignBackward(usize, release_end, page);
+        if (to <= from) return;
+        _ = std.os.linux.madvise(@ptrFromInt(from), to - from, std.os.linux.MADV.DONTNEED);
+    }
+
     /// For tests: wraps a bare writer with no real TLS/TCP layer behind it.
     /// `tcp_writer.err` is left settable so a test can simulate the real
     /// error a write failure should surface.

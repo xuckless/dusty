@@ -1197,6 +1197,11 @@ pub const Response = struct {
         try self.header("Connection", "Upgrade");
         try self.header("Sec-WebSocket-Accept", &accept_key);
         self.streaming = true;
+        // The connection is a WebSocket's from here: small windows, and the
+        // request buffers' other pages back to the OS, the 101 included. It
+        // cannot serve another request after that.
+        self.conn.shrinkForUpgrade();
+        errdefer self.keepalive = false;
         try self.writeHeader();
         // The connection is the WebSocket's now, and whatever the peer sends
         // after the session is not an HTTP request.
