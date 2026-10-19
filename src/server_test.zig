@@ -3376,6 +3376,54 @@ test "Server: a head that does not arrive within read_header closes the connecti
     }
 }
 
+test "Server: a keep-alive request outlives the keepalive timeout; a half head on one does not outlive read_header" {
+    const io = std.testing.io;
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .listeners = loopback,
+        // No request deadline: a whole head buffered at once runs without a
+        // timer, and the keepalive one armed for the wait must not carry
+        // into the handler.
+        .timeout = .{ .request = null, .keepalive = .fromMilliseconds(200), .read_header = .fromMilliseconds(200) },
+    }, {});
+    defer server.deinit();
+    server.router.get("/slow", struct {
+        fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+            try req.io.sleep(.fromMilliseconds(500), .awake);
+            res.body = "slow";
+        }
+    }.handle);
+    var future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer future.cancel(io) catch {};
+    try server.waitReady(io);
+
+    const stream = try server.address.ip.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    var wbuf: [256]u8 = undefined;
+    var w = stream.writer(io, &wbuf);
+    var rbuf: [1024]u8 = undefined;
+    var r = stream.reader(io, &rbuf);
+    for (0..2) |_| {
+        try w.interface.writeAll("GET /slow HTTP/1.1\r\nHost: x\r\n\r\n");
+        try w.interface.flush();
+        const head = try r.interface.takeDelimiterInclusive('\n');
+        try std.testing.expectEqualStrings("HTTP/1.1 200 OK\r\n", head);
+        // The rest of the head, then the four-byte body.
+        while (!std.mem.eql(u8, try r.interface.takeDelimiterInclusive('\n'), "\r\n")) {}
+        try std.testing.expectEqualStrings("slow", try r.interface.take(4));
+    }
+    // Half a head on the kept connection: closed at read_header.
+    try w.interface.writeAll("GET /slow HTTP/1.1\r\nHost: x\r\n");
+    try w.interface.flush();
+    const start: std.Io.Clock.Timestamp = .now(io, .awake);
+    _ = r.interface.peekByte() catch {};
+    const waited = start.durationTo(.now(io, .awake)).raw.toMilliseconds();
+    try std.testing.expect(waited < 2000);
+}
+
 test "Server: a zstd request body is refused with 415 when built without zstd" {
     if (@import("build_options").use_zstd) return error.SkipZigTest;
     const io = std.testing.io;

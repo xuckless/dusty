@@ -1647,6 +1647,13 @@ pub fn Server(comptime Ctx: type) type {
         }
 
         /// `start + duration` on the awake clock, or null for no limit.
+        /// Whether `buffered`, the start of a request, holds its whole head:
+        /// the blank line that ends it is there. A head ended by bare LFs
+        /// is not recognized, which only costs a header deadline.
+        fn headBuffered(buffered: []const u8) bool {
+            return std.mem.indexOf(u8, buffered, "\r\n\r\n") != null;
+        }
+
         fn deadlineAfter(start: std.Io.Clock.Timestamp, duration: ?std.Io.Duration) ?std.Io.Clock.Timestamp {
             const d = duration orelse return null;
             return start.addDuration(.{ .raw = d, .clock = .awake });
@@ -1779,6 +1786,9 @@ pub fn Server(comptime Ctx: type) type {
                 // deadline, and its request deadline runs from arrival. A
                 // request pipelined behind the last one is already here.
                 const first = request_count == 0;
+                // Whether the wait below left a timer armed that the request
+                // itself must replace or clear.
+                var wait_armed = false;
                 if (connection.reader.bufferedLen() == 0) {
                     if (!self.config.request.keep_buffers_between_requests) {
                         if (buffers) |b| {
@@ -1788,7 +1798,9 @@ pub fn Server(comptime Ctx: type) type {
                             buffers = null;
                         }
                     }
-                    self.armTimer(timer, if (first) self.config.timeout.request else self.config.timeout.keepalive);
+                    const wait_timeout = if (first) self.config.timeout.request else self.config.timeout.keepalive;
+                    self.armTimer(timer, wait_timeout);
+                    wait_armed = wait_timeout != null;
                     switch (try self.waitForRequest(connection, busy)) {
                         .arrived => {},
                         .peer_gone => return,
@@ -1810,10 +1822,20 @@ pub fn Server(comptime Ctx: type) type {
                 // first from accept), and its head must arrive within
                 // `timeout.read_header` of the same point, whichever is
                 // sooner; then the request deadline alone applies.
-                const started_at: std.Io.Clock.Timestamp = if (first) accepted_at else .now(self.io, .awake);
-                const request_deadline = deadlineAfter(started_at, self.config.timeout.request);
+                //
+                // A head that is already buffered whole (the usual case: it
+                // came in one read) is parsed without waiting, so it needs no
+                // header deadline: the timer is set once per request rather
+                // than twice, and without a request deadline the clock is not
+                // read at all. A wait timer still armed then lasts through
+                // the parse, which does not wait, and is replaced after it.
+                const head_buffered = headBuffered(connection.reader.buffered());
+                const needs_clock = self.config.timeout.request != null or
+                    (!head_buffered and self.config.timeout.read_header != null);
+                const started_at: std.Io.Clock.Timestamp = if (first or !needs_clock) accepted_at else .now(self.io, .awake);
+                const request_deadline = if (needs_clock) deadlineAfter(started_at, self.config.timeout.request) else null;
                 const header_deadline = earlier(deadlineAfter(started_at, self.config.timeout.read_header), request_deadline);
-                self.armDeadline(timer, header_deadline);
+                if (!head_buffered) self.armDeadline(timer, header_deadline);
                 request_count += 1;
 
                 if (buffers == null) {
@@ -1878,7 +1900,9 @@ pub fn Server(comptime Ctx: type) type {
                     else => |e| return e,
                 };
                 // The head is in: from here the request deadline alone.
-                if (header_deadline != null and (request_deadline == null or !header_deadline.?.compare(.eq, request_deadline.?))) {
+                if (head_buffered) {
+                    if (request_deadline != null or wait_armed) self.armDeadline(timer, request_deadline);
+                } else if (header_deadline != null and (request_deadline == null or !header_deadline.?.compare(.eq, request_deadline.?))) {
                     self.armDeadline(timer, request_deadline);
                 }
 

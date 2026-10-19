@@ -294,6 +294,27 @@ pub fn formatHttpDate(buf: *[29]u8, seconds: i64) []const u8 {
     }) catch unreachable; // years 1970-9999 fit
 }
 
+/// Whole seconds of real time. On Linux from the coarse clock, which the
+/// vDSO answers from its data page without reading the hardware counter: the
+/// header is read on every response and wants only the second, and the
+/// coarse clock trails by at most a tick.
+fn realSeconds(io: std.Io) i64 {
+    const builtin = @import("builtin");
+    if (builtin.os.tag == .linux) {
+        // With libc, through libc: std's own vDSO lookup reads the auxiliary
+        // vector that only its own `_start` records, and would make a
+        // system call of every read.
+        if (builtin.link_libc) {
+            var ts: std.c.timespec = undefined;
+            if (std.c.clock_gettime(.REALTIME_COARSE, &ts) == 0) return @intCast(ts.sec);
+        } else {
+            var ts: std.os.linux.timespec = undefined;
+            if (std.os.linux.clock_gettime(.REALTIME_COARSE, &ts) == 0) return @intCast(ts.sec);
+        }
+    }
+    return std.Io.Clock.real.now(io).toSeconds();
+}
+
 threadlocal var date_cache: [29]u8 = undefined;
 threadlocal var date_cache_len: usize = 0;
 threadlocal var date_cache_seconds: i64 = -1;
@@ -302,7 +323,7 @@ threadlocal var date_cache_seconds: i64 = -1;
 /// once a second per thread. The slice is valid until the next call on this
 /// thread; copy it to keep it.
 pub fn currentHttpDate(io: std.Io) []const u8 {
-    const now = std.Io.Clock.real.now(io).toSeconds();
+    const now = realSeconds(io);
     if (now != date_cache_seconds) {
         date_cache_len = formatHttpDate(&date_cache, now).len;
         date_cache_seconds = now;

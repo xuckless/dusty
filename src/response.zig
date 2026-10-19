@@ -1446,16 +1446,26 @@ pub const Response = struct {
             return sink.head(self.status, &self.headers, self.headLength());
         }
 
-        // Write status line
-        try w.print("HTTP/1.1 {d} {s}\r\n", .{ @intFromEnum(self.status), self.status.phrase() });
+        // Plain writes rather than `print`: a head is on every response, and
+        // these are copies into the write buffer, without format parsing.
+        try w.writeAll("HTTP/1.1 ");
+        try writeDecimal(w, @intFromEnum(self.status));
+        try w.writeByte(' ');
+        try w.writeAll(self.status.phrase());
+        try w.writeAll("\r\n");
         if (self.send_date and self.headers.get("Date") == null) {
-            try w.print("Date: {s}\r\n", .{http.currentHttpDate(self.io)});
+            try w.writeAll("Date: ");
+            try w.writeAll(http.currentHttpDate(self.io));
+            try w.writeAll("\r\n");
         }
 
         // Write headers
         var iter = self.headers.iterator();
         while (iter.next()) |entry| {
-            try w.print("{s}: {s}\r\n", .{ entry.key, entry.value });
+            try w.writeAll(entry.key);
+            try w.writeAll(": ");
+            try w.writeAll(entry.value);
+            try w.writeAll("\r\n");
         }
 
         // Write Connection header based on keepalive. HTTP/1.0 is
@@ -1478,7 +1488,9 @@ pub const Response = struct {
                 // Write Content-Length if not manually set (skip for streaming responses like SSE)
                 const has_content_length = self.headers.get("Content-Length") != null;
                 if (!has_content_length) {
-                    try w.print("Content-Length: {d}\r\n", .{self.bodyLen()});
+                    try w.writeAll("Content-Length: ");
+                    try writeDecimal(w, self.bodyLen());
+                    try w.writeAll("\r\n");
                 }
             }
         }
@@ -1634,6 +1646,31 @@ pub const Response = struct {
         return self.bodyLen();
     }
 };
+
+/// `n` in decimal, as `print("{d}")` writes it.
+fn writeDecimal(w: *std.Io.Writer, n: usize) std.Io.Writer.Error!void {
+    var buf: [20]u8 = undefined;
+    var i: usize = buf.len;
+    var v = n;
+    while (true) {
+        i -= 1;
+        buf[i] = '0' + @as(u8, @intCast(v % 10));
+        v /= 10;
+        if (v == 0) break;
+    }
+    return w.writeAll(buf[i..]);
+}
+
+test writeDecimal {
+    var buf: [64]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    for ([_]usize{ 0, 7, 10, 200, 404, 1234567890, std.math.maxInt(usize) }) |n| {
+        w.end = 0;
+        try writeDecimal(&w, n);
+        var expected: [32]u8 = undefined;
+        try std.testing.expectEqualStrings(try std.fmt.bufPrint(&expected, "{d}", .{n}), w.buffered());
+    }
+}
 
 /// The body a response has collected, in one piece, for comparing.
 fn testBody(response: *const Response, buf: []u8) ![]const u8 {
