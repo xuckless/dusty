@@ -172,6 +172,17 @@ pub fn Engine(comptime Ctx: type) type {
             /// Set while the reader runs the session, so a stream whose head
             /// completes can be handed to a task in the connection's group.
             group: ?*std.Io.Group = null,
+            /// Requests of `no_wait` routes that arrived whole, for the
+            /// reader to run once the session has taken the read. Only the
+            /// reader touches it.
+            ready: std.ArrayList(*Stream) = .empty,
+            /// Requests of `no_wait` routes whose body is still coming: if
+            /// it ends within the same read they run inline too, else they
+            /// get a task once the session has taken the read, so a body is
+            /// never held back waiting for a handler that is not reading it.
+            awaiting: std.ArrayList(*Stream) = .empty,
+            /// The server has `no_wait` routes and runs them inline.
+            inline_ok: bool = false,
             /// The reader is done; the writer sends what is left and exits.
             closing: bool = false,
             /// A GOAWAY went out because the server is draining.
@@ -314,6 +325,10 @@ pub fn Engine(comptime Ctx: type) type {
             /// Request body: DATA in, the handler out. Allocated on the
             /// first DATA frame; a request without a body never has one.
             body: ?std.Io.Queue(u8) = null,
+            /// The stream's receive window, which the body queue holds:
+            /// `stream_window`, raised to `stream_window_reading` once the
+            /// handler reads. Zero until set (`window`).
+            recv_window: u31 = 0,
             /// The request had no body at all (END_STREAM on its HEADERS),
             /// or its body has ended.
             body_done: bool = false,
@@ -329,8 +344,22 @@ pub fn Engine(comptime Ctx: type) type {
             status: http.Status = .ok,
             response_nv: []c.nghttp2_nv = &.{},
             submitted: bool = false,
+            /// A `no_wait` route's request with its body still coming, in
+            /// `Conn.awaiting`.
+            await_body: bool = false,
+            /// The handler runs on the connection's reader (a `no_wait`
+            /// route), which must never wait for the writer: its body goes
+            /// to `backlog`, which grows as needed, instead of the queue.
+            inline_mode: bool = false,
+            backlog: std.ArrayList(u8) = .empty,
+            backlog_pos: usize = 0,
             /// Response body: the handler in, the data provider out.
             out: ?std.Io.Queue(u8) = null,
+            /// Or a whole body in memory (`StreamSink.complete`), which the
+            /// provider takes in order: `parts[part][part_offset..]` is next.
+            parts: []const []const u8 = &.{},
+            part: usize = 0,
+            part_offset: usize = 0,
             /// Trailers for the provider to send after the body.
             trailer_nv: []c.nghttp2_nv = &.{},
             /// The handler ended the response.
@@ -350,6 +379,39 @@ pub fn Engine(comptime Ctx: type) type {
             discard_left: usize = 0,
 
             const Field = struct { name: []const u8, value: []const u8 };
+
+            fn window(stream: *const Stream) u31 {
+                return if (stream.recv_window != 0) stream.recv_window else stream.conn.config.stream_window;
+            }
+
+            /// The handler reads the body: the stream's window grows to
+            /// `stream_window_reading`, and the body queue with it, so the
+            /// session can still always put a whole window. Under the
+            /// mutex.
+            fn raiseWindow(stream: *Stream) void {
+                const conn = stream.conn;
+                const want = conn.config.stream_window_reading;
+                if (stream.recv_window != 0 or want <= conn.config.stream_window) return;
+                stream.recv_window = conn.config.stream_window;
+                if (stream.body_done or stream.reset or stream.discarding) return;
+                const buf = stream.arena.allocator().alloc(u8, want) catch return;
+                var bigger: std.Io.Queue(u8) = .init(buf);
+                if (stream.body) |*q| {
+                    // What is queued moves over, in order; nobody else gets
+                    // from it (this is the handler), and the session puts
+                    // only under the mutex.
+                    var scratch: [4096]u8 = undefined;
+                    while (true) {
+                        const n = q.getUncancelable(conn.io, &scratch, 0) catch break;
+                        if (n == 0) break;
+                        _ = bigger.putUncancelable(conn.io, scratch[0..n], 0) catch unreachable;
+                    }
+                }
+                if (c.nghttp2_session_set_local_window_size(conn.session, c.NGHTTP2_FLAG_NONE, stream.id, want) != 0) return;
+                stream.body = bigger;
+                stream.recv_window = want;
+                conn.kickWriter();
+            }
 
             /// A stream from the connection's spares (its arena reset, with
             /// what it grew to kept), or a new one. Under the mutex.
@@ -436,7 +498,10 @@ pub fn Engine(comptime Ctx: type) type {
                 .io = server.io,
                 .allocator = server.allocator,
                 .config = server.config.http2,
+                .inline_ok = server.config.http2.inline_no_wait and server.router.has_no_wait,
             };
+            defer conn.ready.deinit(conn.allocator);
+            defer conn.awaiting.deinit(conn.allocator);
             try conn.initSession();
             server.h2_conns.add(&conn);
             defer {
@@ -526,6 +591,7 @@ pub fn Engine(comptime Ctx: type) type {
                         conn.group = group;
                         defer conn.group = null;
                         const rv = c.nghttp2_session_mem_recv2(conn.session, buffered.ptr, buffered.len);
+                        if (conn.awaiting.items.len > 0) startAwaiting(conn);
                         if (rv < 0) {
                             log.debug("HTTP/2 session: {s}", .{c.nghttp2_strerror(@intCast(rv))});
                             // nghttp2 queued a GOAWAY for a protocol error;
@@ -535,6 +601,9 @@ pub fn Engine(comptime Ctx: type) type {
                         break :consumed @as(usize, @intCast(rv));
                     };
                     reader.toss(consumed);
+                    // The requests that run inline answer before the one
+                    // kick, so their responses share the next write.
+                    if (conn.ready.items.len > 0) try runInline(conn);
                     conn.kickWriter();
 
                     conn.lock();
@@ -587,10 +656,14 @@ pub fn Engine(comptime Ctx: type) type {
 
         /// Takes the session's output under the mutex, a frame at a time,
         /// and writes it outside. A frame from `mem_send2` is valid only
-        /// until the next call, so it is copied into `staging` first.
+        /// until the next call, so it is copied straight into the
+        /// connection's write buffer, where it waits for the one write of
+        /// this round. A frame that does not fit there (a full DATA frame,
+        /// or the buffer filled up) goes to `spill`, which the writer frees
+        /// whenever it runs out of output, so an idle connection holds none.
         fn runWriter(conn: *Conn) !void {
-            var staging: std.ArrayList(u8) = .empty;
-            defer staging.deinit(conn.allocator);
+            var spill: std.ArrayList(u8) = .empty;
+            defer spill.deinit(conn.allocator);
             const writer = conn.connection.writer;
             var probed = false;
             while (true) {
@@ -600,18 +673,28 @@ pub fn Engine(comptime Ctx: type) type {
                     conn.lock();
                     defer conn.unlock();
                     closing = conn.closing;
-                    while (staging.items.len < 64 * 1024) {
+                    while (true) {
                         var data: [*c]const u8 = undefined;
                         const n = c.nghttp2_session_mem_send2(conn.session, &data);
                         if (n < 0) return error.Http2ProtocolError;
                         if (n == 0) break;
-                        try staging.appendSlice(conn.allocator, data[0..@intCast(n)]);
+                        const frame = data[0..@intCast(n)];
+                        const room = writer.unusedCapacitySlice();
+                        if (spill.items.len == 0 and frame.len <= room.len) {
+                            @memcpy(room[0..frame.len], frame);
+                            writer.advance(frame.len);
+                            continue;
+                        }
+                        try spill.appendSlice(conn.allocator, frame);
+                        if (spill.items.len >= 64 * 1024) break;
                     }
                 }
-                if (staging.items.len > 0) {
-                    writer.writeAll(staging.items) catch return conn.connection.getWriteError() orelse error.Unexpected;
+                if (writer.end > 0 or spill.items.len > 0) {
+                    if (spill.items.len > 0) {
+                        writer.writeAll(spill.items) catch return conn.connection.getWriteError() orelse error.Unexpected;
+                        spill.clearRetainingCapacity();
+                    }
                     writer.flush() catch return conn.connection.getWriteError() orelse error.Unexpected;
-                    staging.clearRetainingCapacity();
                     // The drain's final GOAWAY is on the wire now.
                     if (@atomicLoad(bool, &conn.drain_flush, .acquire)) {
                         conn.lock();
@@ -645,6 +728,9 @@ pub fn Engine(comptime Ctx: type) type {
                     return;
                 }
                 if (closing and !handlers_running) return;
+                // Nothing to send: the spill's memory goes back while the
+                // connection waits.
+                spill.clearAndFree(conn.allocator);
                 if (closing) {
                     // A peer that closed the whole connection answers the
                     // probe with a TCP reset, so the next write fails;
@@ -689,33 +775,62 @@ pub fn Engine(comptime Ctx: type) type {
                 log.debug("HTTP/2 stream {d} reset before its handler started", .{stream.id});
                 return;
             }
-            serveStream(conn, stream) catch |err| {
-                if (err == error.Canceled) {
-                    conn.lock();
-                    const reset = stream.reset;
-                    conn.unlock();
-                    // Canceled because the peer reset the stream or the
-                    // connection went away: the stream is over already.
-                    if (reset) {
-                        log.debug("HTTP/2 stream {d}: handler canceled, the stream was reset", .{stream.id});
-                        return;
-                    }
-                    resetStream(conn, stream, c.NGHTTP2_CANCEL);
-                    return error.Canceled;
+            serveStream(conn, stream, false) catch |err| return streamFailed(conn, stream, err);
+        }
+
+        /// Runs the requests `onFrameRecv` set aside for the reader
+        /// (`no_wait` routes), in the order they arrived.
+        fn runInline(conn: *Conn) error{Canceled}!void {
+            defer conn.ready.clearRetainingCapacity();
+            for (conn.ready.items) |stream| {
+                conn.lock();
+                const gone = stream.reset;
+                conn.unlock();
+                var canceled = false;
+                if (!gone) {
+                    serveStream(conn, stream, true) catch |err| {
+                        streamFailed(conn, stream, err) catch {
+                            canceled = true;
+                        };
+                    };
                 }
-                // `Response.abort`: the reset is the abort.
-                if (err == error.ResponseAborted) {
-                    log.debug("HTTP/2 stream {d}: response aborted", .{stream.id});
-                    resetStream(conn, stream, c.NGHTTP2_CANCEL);
+                conn.lock();
+                stream.release(.handler);
+                conn.unlock();
+                // The reader itself is canceled: the connection is going.
+                if (canceled) return error.Canceled;
+            }
+        }
+
+        /// What a handler's error means for its stream. `error.Canceled`
+        /// when the handler's own task was canceled for another reason
+        /// than the stream's reset, to pass on.
+        fn streamFailed(conn: *Conn, stream: *Stream, err: anyerror) error{Canceled}!void {
+            if (err == error.Canceled) {
+                conn.lock();
+                const reset = stream.reset;
+                conn.unlock();
+                // Canceled because the peer reset the stream or the
+                // connection went away: the stream is over already.
+                if (reset) {
+                    log.debug("HTTP/2 stream {d}: handler canceled, the stream was reset", .{stream.id});
                     return;
                 }
-                if (stream.reset or err == error.ConnectionResetByPeer) {
-                    log.debug("HTTP/2 stream {d} reset: {}", .{ stream.id, err });
-                } else {
-                    log.err("HTTP/2 stream {d}: {}", .{ stream.id, err });
-                    resetStream(conn, stream, c.NGHTTP2_INTERNAL_ERROR);
-                }
-            };
+                resetStream(conn, stream, c.NGHTTP2_CANCEL);
+                return error.Canceled;
+            }
+            // `Response.abort`: the reset is the abort.
+            if (err == error.ResponseAborted) {
+                log.debug("HTTP/2 stream {d}: response aborted", .{stream.id});
+                resetStream(conn, stream, c.NGHTTP2_CANCEL);
+                return;
+            }
+            if (stream.reset or err == error.ConnectionResetByPeer) {
+                log.debug("HTTP/2 stream {d} reset: {}", .{ stream.id, err });
+            } else {
+                log.err("HTTP/2 stream {d}: {}", .{ stream.id, err });
+                resetStream(conn, stream, c.NGHTTP2_INTERNAL_ERROR);
+            }
         }
 
         fn resetStream(conn: *Conn, stream: *Stream, code: u32) void {
@@ -727,14 +842,17 @@ pub fn Engine(comptime Ctx: type) type {
             conn.kickWriter();
         }
 
-        fn serveStream(conn: *Conn, stream: *Stream) !void {
+        /// Serves one request. `inline_mode`: on the connection's reader
+        /// (a `no_wait` route), with no request timeout, whose timer would
+        /// cancel the reader.
+        fn serveStream(conn: *Conn, stream: *Stream, inline_mode: bool) !void {
             const server = conn.server;
             const arena = stream.arena.allocator();
             const io = conn.io;
 
             var timer: Timer = .init(null);
             defer timer.clear(io);
-            if (server.config.timeout.request) |d| timer.set(io, .{ .duration = .{ .raw = d, .clock = .awake } });
+            if (!inline_mode) if (server.config.timeout.request) |d| timer.set(io, .{ .duration = .{ .raw = d, .clock = .awake } });
 
             var request: Request = .{
                 .arena = arena,
@@ -749,8 +867,8 @@ pub fn Engine(comptime Ctx: type) type {
                 .version_minor = 0,
                 .drain = &server.draining,
                 .drain_hooks = &server.drain_hooks,
-                ._timeout_context = &timer,
-                ._set_timeout = setTimeout,
+                ._timeout_context = if (inline_mode) null else &timer,
+                ._set_timeout = if (inline_mode) null else setTimeout,
             };
             var body_reader: BodyReader = .init(stream);
             request.body_source = .{ .reader = &body_reader.interface, .err = BodyReader.errorOf };
@@ -865,6 +983,7 @@ pub fn Engine(comptime Ctx: type) type {
                 const queue = blk: {
                     while (true) {
                         conn.lock();
+                        stream.raiseWindow();
                         const q = if (stream.body) |*q| q else null;
                         const done = stream.body_done;
                         const reset = stream.reset;
@@ -921,7 +1040,58 @@ pub fn Engine(comptime Ctx: type) type {
                     .end = end,
                     .writeError = writeError,
                     .peerGone = peerGone,
+                    .complete = complete,
                 } };
+            }
+
+            /// A whole response in memory: the head and the body submitted
+            /// together, with the body read straight from where it lies. The
+            /// stream ends on the last DATA frame, or on HEADERS when there
+            /// is no body.
+            fn complete(
+                ptr: *anyopaque,
+                status: http.Status,
+                headers: *const http.Headers,
+                content_length: ?usize,
+                parts: []const []const u8,
+                trailers: ?*const http.Headers,
+            ) std.Io.Writer.Error!void {
+                const self = fromPtr(ptr);
+                const stream = self.stream;
+                const conn = stream.conn;
+                const arena = stream.arena.allocator();
+                try head(ptr, status, headers, content_length);
+                const trailer_nv = try self.trailerFields(trailers);
+                var kept: usize = 0;
+                for (parts) |part| {
+                    if (part.len > 0) kept += 1;
+                }
+                const list = arena.alloc([]const u8, kept) catch return self.fail(error.SystemResources);
+                kept = 0;
+                for (parts) |part| {
+                    if (part.len == 0) continue;
+                    list[kept] = part;
+                    kept += 1;
+                }
+                conn.lock();
+                defer conn.unlock();
+                stream.parts = list;
+                stream.trailer_nv = trailer_nv;
+                stream.ended = true;
+                try self.submit(list.len > 0 or trailer_nv.len > 0);
+            }
+
+            /// The trailers as nghttp2 fields, in the stream's arena.
+            fn trailerFields(self: *StreamSink, trailers: ?*const http.Headers) std.Io.Writer.Error![]c.nghttp2_nv {
+                const t = trailers orelse return &.{};
+                const arena = self.stream.arena.allocator();
+                var trailer_nv: std.ArrayList(c.nghttp2_nv) = .empty;
+                var it = t.iterator();
+                while (it.next()) |entry| {
+                    const name = lowerName(arena, entry.key) catch return self.fail(error.SystemResources);
+                    trailer_nv.append(arena, ownedField(name, entry.value, false)) catch return self.fail(error.SystemResources);
+                }
+                return trailer_nv.items;
             }
 
             fn fromPtr(ptr: *anyopaque) *StreamSink {
@@ -945,26 +1115,31 @@ pub fn Engine(comptime Ctx: type) type {
                 const stream = self.stream;
                 const arena = stream.arena.allocator();
                 stream.status = status;
-                var nv: std.ArrayList(c.nghttp2_nv) = .empty;
-                var status_buf: [3]u8 = undefined;
-                const status_text = std.fmt.bufPrint(&status_buf, "{d}", .{@intFromEnum(status)}) catch unreachable;
-                nv.append(arena, field(":status", arena.dupe(u8, status_text) catch return self.fail(error.SystemResources))) catch return self.fail(error.SystemResources);
+                // Sized once: the status, every header, and a length.
+                const nv = arena.alloc(c.nghttp2_nv, headers.count() + 2) catch return self.fail(error.SystemResources);
+                var count: usize = 0;
+                nv[count] = ownedField(":status", statusText(status), true);
+                count += 1;
                 var has_length = false;
                 var it = headers.iterator();
                 while (it.next()) |entry| {
                     // RFC 9113 §8.2.2: connection-specific fields are malformed.
                     if (isConnectionSpecific(entry.key)) continue;
                     if (std.ascii.eqlIgnoreCase(entry.key, "content-length")) has_length = true;
-                    const name = std.ascii.allocLowerString(arena, entry.key) catch return self.fail(error.SystemResources);
-                    nv.append(arena, field(name, entry.value)) catch return self.fail(error.SystemResources);
+                    const name = lowerName(arena, entry.key) catch return self.fail(error.SystemResources);
+                    // The value may be the handler's, and the head can be
+                    // submitted while the handler runs on: nghttp2 copies it.
+                    nv[count] = ownedField(name, entry.value, false);
+                    count += 1;
                 }
                 if (!has_length and statusHasLength(status)) {
                     if (content_length) |len| {
                         const text = std.fmt.allocPrint(arena, "{d}", .{len}) catch return self.fail(error.SystemResources);
-                        nv.append(arena, field("content-length", text)) catch return self.fail(error.SystemResources);
+                        nv[count] = ownedField("content-length", text, true);
+                        count += 1;
                     }
                 }
-                stream.response_nv = nv.items;
+                stream.response_nv = nv[0..count];
             }
 
             fn interim(ptr: *anyopaque, status: http.Status) std.Io.Writer.Error!void {
@@ -1027,7 +1202,7 @@ pub fn Engine(comptime Ctx: type) type {
                 {
                     conn.lock();
                     defer conn.unlock();
-                    if (stream.out == null) {
+                    if (stream.out == null and !stream.inline_mode) {
                         const buf = stream.arena.allocator().alloc(u8, out_queue_len) catch return self.fail(error.SystemResources);
                         stream.out = .init(buf);
                     }
@@ -1046,7 +1221,7 @@ pub fn Engine(comptime Ctx: type) type {
                 {
                     conn.lock();
                     defer conn.unlock();
-                    if (stream.out == null) {
+                    if (stream.out == null and !stream.inline_mode) {
                         const buf = stream.arena.allocator().alloc(u8, out_queue_len) catch return self.fail(error.SystemResources);
                         stream.out = .init(buf);
                     }
@@ -1073,6 +1248,18 @@ pub fn Engine(comptime Ctx: type) type {
                 if (bytes.len == 0) return;
                 const stream = self.stream;
                 const conn = stream.conn;
+                if (stream.inline_mode) {
+                    // On the reader: never wait for the writer, which may
+                    // need the reader to take a WINDOW_UPDATE first. The
+                    // reader kicks the writer when its inline requests are
+                    // done.
+                    conn.lock();
+                    defer conn.unlock();
+                    if (stream.reset) return self.fail(error.ConnectionResetByPeer);
+                    stream.backlog.appendSlice(stream.arena.allocator(), bytes) catch return self.fail(error.SystemResources);
+                    _ = c.nghttp2_session_resume_data(conn.session, stream.id);
+                    return;
+                }
                 var rest = bytes;
                 while (rest.len > 0) {
                     // At most a queue's worth at a time, so the provider is
@@ -1093,21 +1280,19 @@ pub fn Engine(comptime Ctx: type) type {
                 const self = fromPtr(ptr);
                 const stream = self.stream;
                 const conn = stream.conn;
-                const arena = stream.arena.allocator();
-                var trailer_nv: std.ArrayList(c.nghttp2_nv) = .empty;
-                if (trailers) |t| {
-                    var it = t.iterator();
-                    while (it.next()) |entry| {
-                        const name = std.ascii.allocLowerString(arena, entry.key) catch return self.fail(error.SystemResources);
-                        trailer_nv.append(arena, field(name, entry.value)) catch return self.fail(error.SystemResources);
-                    }
-                }
+                const trailer_nv = try self.trailerFields(trailers);
                 conn.lock();
                 defer conn.unlock();
-                stream.trailer_nv = trailer_nv.items;
+                stream.trailer_nv = trailer_nv;
                 stream.ended = true;
                 if (stream.out) |*q| {
                     q.close(conn.io);
+                    _ = c.nghttp2_session_resume_data(conn.session, stream.id);
+                    conn.kickWriter();
+                    return;
+                }
+                // An inline stream's body went out through its backlog.
+                if (stream.submitted) {
                     _ = c.nghttp2_session_resume_data(conn.session, stream.id);
                     conn.kickWriter();
                     return;
@@ -1137,6 +1322,55 @@ pub fn Engine(comptime Ctx: type) type {
                 .valuelen = value.len,
                 .flags = c.NGHTTP2_NV_FLAG_NONE,
             };
+        }
+
+        /// A field whose name is lowercase and lives as long as the stream
+        /// (a literal, or in the stream's arena), so nghttp2 neither copies
+        /// nor lowercases it; the value too, when `value_owned`.
+        fn ownedField(name: []const u8, value: []const u8, value_owned: bool) c.nghttp2_nv {
+            return .{
+                .name = @constCast(name.ptr),
+                .namelen = name.len,
+                .value = @constCast(value.ptr),
+                .valuelen = value.len,
+                .flags = @intCast(c.NGHTTP2_NV_FLAG_NO_COPY_NAME |
+                    if (value_owned) c.NGHTTP2_NV_FLAG_NO_COPY_VALUE else c.NGHTTP2_NV_FLAG_NONE),
+            };
+        }
+
+        /// The common response field names, lowercase, so the usual head
+        /// takes no allocation for its names.
+        const common_names = [_][]const u8{
+            "content-type",                "content-length",            "date",        "server",
+            "vary",                        "cache-control",             "etag",        "last-modified",
+            "content-encoding",            "location",                  "set-cookie",  "x-request-id",
+            "accept-ranges",               "content-range",             "expires",     "alt-svc",
+            "access-control-allow-origin", "strict-transport-security", "grpc-status", "grpc-message",
+            "grpc-encoding",               "content-disposition",       "traceparent", "allow",
+        };
+
+        /// `name` in lowercase: a literal for the common names, else a copy
+        /// in `arena`.
+        fn lowerName(arena: std.mem.Allocator, name: []const u8) ![]const u8 {
+            for (common_names) |known| {
+                if (known.len == name.len and std.ascii.eqlIgnoreCase(known, name)) return known;
+            }
+            return std.ascii.allocLowerString(arena, name);
+        }
+
+        /// The three digits of a status code, as a literal.
+        fn statusText(status: http.Status) []const u8 {
+            const code: usize = @intFromEnum(status);
+            if (code < 100 or code > 999) return "500";
+            const table = comptime blk: {
+                @setEvalBranchQuota(10_000);
+                var t: [900][3]u8 = undefined;
+                for (&t, 100..) |*digits, n| {
+                    digits.* = .{ '0' + n / 100, '0' + n / 10 % 10, '0' + n % 10 };
+                }
+                break :blk t;
+            };
+            return &table[code - 100];
         }
 
         fn isConnectionSpecific(name: []const u8) bool {
@@ -1247,12 +1481,22 @@ pub fn Engine(comptime Ctx: type) type {
                 c.NGHTTP2_HEADERS => {
                     if (frame.*.headers.cat == c.NGHTTP2_HCAT_REQUEST) {
                         if (end_stream) stream.closeBody();
-                        startStream(conn, stream);
+                        if (conn.inline_ok and noWaitRoute(conn, stream)) {
+                            if (end_stream) {
+                                queueInline(conn, stream);
+                            } else if (conn.awaiting.append(conn.allocator, stream)) |_| {
+                                stream.await_body = true;
+                            } else |_| startStream(conn, stream);
+                        } else startStream(conn, stream);
                     } else if (end_stream) {
                         stream.closeBody(); // trailers end the body
+                        bodyEnded(conn, stream);
                     }
                 },
-                c.NGHTTP2_DATA => if (end_stream) stream.closeBody(),
+                c.NGHTTP2_DATA => if (end_stream) {
+                    stream.closeBody();
+                    bodyEnded(conn, stream);
+                },
                 else => {},
             }
             conn.kickWriter(); // also wakes a body reader waiting for its queue
@@ -1273,6 +1517,49 @@ pub fn Engine(comptime Ctx: type) type {
                 stream.release(.handler);
                 _ = c.nghttp2_submit_rst_stream(conn.session, c.NGHTTP2_FLAG_NONE, stream.id, c.NGHTTP2_REFUSED_STREAM);
             };
+        }
+
+        /// Whether the request's route was registered `no_wait`. An
+        /// extended CONNECT never is: it is a tunnel, whatever it routes as.
+        fn noWaitRoute(conn: *Conn, stream: *Stream) bool {
+            const method = parseMethod(stream.method) orelse return false;
+            if (method == .connect) return false;
+            return conn.server.router.noWait(method, stream.path);
+        }
+
+        /// The head is complete, the request whole and its route `no_wait`:
+        /// count the stream in flight and leave it for the reader to run
+        /// (`runInline`) once the session has taken the read.
+        fn queueInline(conn: *Conn, stream: *Stream) void {
+            conn.ready.append(conn.allocator, stream) catch return startStream(conn, stream);
+            _ = conn.server.busy.fetchAdd(.{ .count = 1 }, .acq_rel);
+            conn.open_streams += 1;
+            stream.counted = true;
+            stream.inline_mode = true;
+        }
+
+        /// The body of a request set aside in `awaiting` is whole: it runs
+        /// inline after all.
+        fn bodyEnded(conn: *Conn, stream: *Stream) void {
+            if (!stream.await_body) return;
+            stream.await_body = false;
+            queueInline(conn, stream);
+        }
+
+        /// After a read: the `no_wait` requests whose body did not end in
+        /// it get a task, as any other request; one reset meanwhile is let
+        /// go. Under the mutex, with the group set.
+        fn startAwaiting(conn: *Conn) void {
+            defer conn.awaiting.clearRetainingCapacity();
+            for (conn.awaiting.items) |stream| {
+                if (!stream.await_body) continue;
+                stream.await_body = false;
+                if (stream.reset) {
+                    stream.release(.handler);
+                    continue;
+                }
+                startStream(conn, stream);
+            }
         }
 
         /// Notes when the frame that ends a response is out. If the handler
@@ -1318,7 +1605,7 @@ pub fn Engine(comptime Ctx: type) type {
                 return;
             }
             stream.discarding = true;
-            stream.discard_left = conn.config.stream_window;
+            stream.discard_left = stream.window();
             // What is queued was never credited back: credit it now.
             if (stream.body) |*q| {
                 var scratch: [4096]u8 = undefined;
@@ -1352,7 +1639,7 @@ pub fn Engine(comptime Ctx: type) type {
                 return 0;
             }
             if (stream.body == null) {
-                const buf = stream.arena.allocator().alloc(u8, conn.config.stream_window) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+                const buf = stream.arena.allocator().alloc(u8, stream.window()) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
                 stream.body = .init(buf);
             }
             // Cannot block: the queue holds a whole window, and the peer may
@@ -1379,7 +1666,9 @@ pub fn Engine(comptime Ctx: type) type {
 
         /// Data provider: takes what the handler queued without waiting.
         /// Empty and not ended defers the stream until the handler resumes
-        /// it; ended sends the end, with the trailers if there are any.
+        /// it; ended sends the end, with the trailers if there are any. The
+        /// end goes on the frame with the last bytes, not on an empty one
+        /// after them.
         fn provideData(
             session: ?*c.nghttp2_session,
             stream_id: i32,
@@ -1393,22 +1682,57 @@ pub fn Engine(comptime Ctx: type) type {
             const stream: *Stream = @ptrCast(@alignCast(source.*.ptr.?));
             if (stream.out) |*q| {
                 const n = q.getUncancelable(conn.io, buf[0..length], 0) catch |err| switch (err) {
-                    error.Closed => return finish(session, stream_id, stream, data_flags),
+                    error.Closed => return finish(session, stream_id, stream, data_flags, 0),
                 };
-                if (n > 0) return @intCast(n);
+                // Once the handler has ended the response nothing more is
+                // put (the queue is closed and nobody waits to put), so an
+                // empty queue is the end of the body.
+                if (n > 0) {
+                    if (stream.ended and q.type_erased.len == 0) return finish(session, stream_id, stream, data_flags, n);
+                    return @intCast(n);
+                }
                 if (!stream.ended) return c.NGHTTP2_ERR_DEFERRED;
+                return finish(session, stream_id, stream, data_flags, 0);
             }
-            return finish(session, stream_id, stream, data_flags);
+            if (stream.inline_mode and stream.parts.len == 0) {
+                const pending = stream.backlog.items[stream.backlog_pos..];
+                const n = @min(pending.len, length);
+                @memcpy(buf[0..n], pending[0..n]);
+                stream.backlog_pos += n;
+                if (stream.backlog_pos == stream.backlog.items.len) {
+                    stream.backlog.clearRetainingCapacity();
+                    stream.backlog_pos = 0;
+                }
+                if (n > 0) {
+                    if (stream.ended and stream.backlog.items.len == 0) return finish(session, stream_id, stream, data_flags, n);
+                    return @intCast(n);
+                }
+                if (!stream.ended) return c.NGHTTP2_ERR_DEFERRED;
+                return finish(session, stream_id, stream, data_flags, 0);
+            }
+            var n: usize = 0;
+            while (n < length and stream.part < stream.parts.len) {
+                const rest = stream.parts[stream.part][stream.part_offset..];
+                const take = @min(rest.len, length - n);
+                @memcpy(buf[n..][0..take], rest[0..take]);
+                n += take;
+                if (take == rest.len) {
+                    stream.part += 1;
+                    stream.part_offset = 0;
+                } else stream.part_offset += take;
+            }
+            if (stream.part < stream.parts.len) return @intCast(n);
+            return finish(session, stream_id, stream, data_flags, n);
         }
 
-        fn finish(session: ?*c.nghttp2_session, stream_id: i32, stream: *Stream, data_flags: [*c]u32) c.nghttp2_ssize {
+        fn finish(session: ?*c.nghttp2_session, stream_id: i32, stream: *Stream, data_flags: [*c]u32, n: usize) c.nghttp2_ssize {
             data_flags.* |= c.NGHTTP2_DATA_FLAG_EOF;
             if (stream.trailer_nv.len > 0) {
                 data_flags.* |= c.NGHTTP2_DATA_FLAG_NO_END_STREAM;
                 if (c.nghttp2_submit_trailer(session, stream_id, stream.trailer_nv.ptr, stream.trailer_nv.len) != 0)
                     return c.NGHTTP2_ERR_CALLBACK_FAILURE;
             }
-            return 0;
+            return @intCast(n);
         }
     };
 }

@@ -1442,12 +1442,7 @@ pub const Response = struct {
     /// writing to a `std.Io.Writer` does; the public entry point resolves it.
     fn sendHeader(self: *Response, w: *std.Io.Writer) std.Io.Writer.Error!void {
         if (self.sink) |sink| {
-            if (self.send_date and self.headers.get("Date") == null) {
-                // The cached date is per thread and short-lived; the sink may
-                // send the head from another task.
-                const date = self.arena.dupe(u8, http.currentHttpDate(self.io)) catch return error.WriteFailed;
-                self.headers.put("Date", date) catch {};
-            }
+            try self.addSinkDate();
             return sink.head(self.status, &self.headers, self.headLength());
         }
 
@@ -1572,7 +1567,46 @@ pub const Response = struct {
             if (self.sendsBody()) try self.sendFileBody(body);
             return self.resolve(self.finish(self.bodyOut()));
         }
+        // A whole body in memory goes to a sink that takes it in one call.
+        if (send_header) if (self.sink) |sink| if (sink.canComplete()) {
+            return self.resolve(self.completeSink(sink));
+        };
         return self.resolve(self.sendBody(self.bodyOut(), send_header));
+    }
+
+    /// The head, a body in memory and the end, in one call to the sink.
+    fn completeSink(self: *Response, sink: Sink) std.Io.Writer.Error!void {
+        try self.addSinkDate();
+        var parts: []const []const u8 = &.{};
+        if (self.sendsBody()) {
+            if (self.body_buffer.len() > 0) {
+                var count: usize = 0;
+                var it = self.body_buffer.segments.first;
+                while (it) |node| : (it = node.next) count += 1;
+                const list = self.arena.alloc([]const u8, count) catch return error.WriteFailed;
+                var i: usize = 0;
+                it = self.body_buffer.segments.first;
+                while (it) |node| : (it = node.next) {
+                    const segment = BodyBuffer.Segment.fromNode(node);
+                    list[i] = segment.bytes()[0..segment.len];
+                    i += 1;
+                }
+                parts = list;
+            } else if (self.body.len > 0) {
+                parts = (&self.body)[0..1];
+            }
+        }
+        return sink.complete(self.status, &self.headers, self.headLength(), parts, if (self.trailers) |*t| t else null);
+    }
+
+    /// A sink's head carries a Date of its own: the cached one is per
+    /// thread and short-lived, and the sink may send the head from another
+    /// task.
+    fn addSinkDate(self: *Response) std.Io.Writer.Error!void {
+        if (self.send_date and self.headers.get("Date") == null) {
+            const date = self.arena.dupe(u8, http.currentHttpDate(self.io)) catch return error.WriteFailed;
+            self.headers.put("Date", date) catch {};
+        }
     }
 
     fn sendFileBody(self: *Response, body: BodyFile) WriteError!void {

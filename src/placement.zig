@@ -102,7 +102,8 @@ pub const Task = if (have_task_cancel) @typeInfo(@FieldType(zio.AutoCancel, "tas
 pub fn currentTask(io: std.Io) ?Task {
     if (comptime !have_task_cancel) return null;
     if (zio.Runtime.fromIo(io) == null) return null;
-    // zio has no public "current task", but an armed `AutoCancel` records
+    if (comptime @hasDecl(zio, "currentTask")) return zio.currentTask();
+    // An older zio has no public "current task", but an armed `AutoCancel` records
     // the task it will cancel. Armed far out and cleared at once: the timer
     // never fires.
     var probe: zio.AutoCancel = .init;

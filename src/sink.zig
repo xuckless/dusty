@@ -34,6 +34,16 @@ pub const Sink = struct {
         /// Whether the peer went away (closed the stream or the connection),
         /// so a failure is not the handler's fault.
         peerGone: *const fn (ptr: *anyopaque) bool,
+        /// Optional: the whole message at once, for a response whose body
+        /// is all in memory (a buffered body, not a file or a stream): the
+        /// head as `head` gets it, the body as `parts` in order, and the
+        /// trailers as `end` gets them. Replaces `head`, `body` and `end`
+        /// for that response, so the engine can frame it in one go (the
+        /// end of the message on the last body frame, or on the head when
+        /// there is no body) without a body writer or queue. `parts` and
+        /// what they point to stay valid until the request's arena is
+        /// reset; the slice itself does not, so copy it.
+        complete: ?*const fn (ptr: *anyopaque, status: http.Status, headers: *const http.Headers, content_length: ?usize, parts: []const []const u8, trailers: ?*const http.Headers) std.Io.Writer.Error!void = null,
     };
 
     pub fn head(self: Sink, status: http.Status, headers: *const http.Headers, content_length: ?usize) std.Io.Writer.Error!void {
@@ -53,5 +63,11 @@ pub const Sink = struct {
     }
     pub fn peerGone(self: Sink) bool {
         return self.vtable.peerGone(self.ptr);
+    }
+    pub fn canComplete(self: Sink) bool {
+        return self.vtable.complete != null;
+    }
+    pub fn complete(self: Sink, status: http.Status, headers: *const http.Headers, content_length: ?usize, parts: []const []const u8, trailers: ?*const http.Headers) std.Io.Writer.Error!void {
+        return self.vtable.complete.?(self.ptr, status, headers, content_length, parts, trailers);
     }
 };
