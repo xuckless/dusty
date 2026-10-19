@@ -1,11 +1,18 @@
 const std = @import("std");
 const Transport = @import("transport.zig").Transport;
+const placement = @import("placement.zig");
 
 /// An established WebSocket connection (RFC 6455). Obtained from
 /// `Response.upgradeWebSocket` on the server side and `Client.connectWebSocket`
 /// on the client side; call `deinit` when done.
 ///
 /// One task may call `receive`; any number of tasks may send concurrently.
+///
+/// Replies go out once per read: while the peer's next message is already
+/// in the read buffer, what the reading task sends waits there too (see
+/// `Batch`), so a peer that pipelines messages gets one write per batch
+/// rather than one per message. Sends from any other task are written at
+/// once, as are the reading task's when nothing more is waiting.
 pub const WebSocket = struct {
     io: std.Io,
     /// The connection underneath, and the only thing that knows why a frame
@@ -34,6 +41,9 @@ pub const WebSocket = struct {
     /// the buffer fills. Pongs sent by `receive` and close frames are always
     /// flushed, taking any buffered frames with them.
     autoflush: bool = true,
+    /// Holds the reading task's replies while more of the peer's messages
+    /// are buffered.
+    batch: Batch = .{},
 
     pub const default_max_message_size: usize = 16 * 1024 * 1024; // 16MB
 
@@ -107,6 +117,7 @@ pub const WebSocket = struct {
 
     /// Free resources. Must be called when done with the WebSocket.
     pub fn deinit(self: *WebSocket) void {
+        self.batch.deinit(self.io);
         self.msg_arena.deinit();
     }
 
@@ -124,7 +135,8 @@ pub const WebSocket = struct {
     /// complete in the read buffer, without blocking for more. A close
     /// message comes in a batch of its own, so the messages before it can
     /// still be answered. The messages are valid until the next call to
-    /// receive(), receiveMany() or tryReceive().
+    /// receive(), receiveMany() or tryReceive(). With more than one, the
+    /// answers to them are a batch (`Batch`) until the next call.
     pub fn receiveMany(self: *WebSocket) ![]const Message {
         self.resetMessages();
         const arena = self.msg_arena.allocator();
@@ -134,6 +146,7 @@ pub const WebSocket = struct {
             const msg = try self.nextBufferedMessage() orelse break;
             try msgs.append(arena, msg);
         }
+        if (msgs.items.len > 1) self.batch.round(self.io, true);
         return msgs.items;
     }
 
@@ -154,6 +167,16 @@ pub const WebSocket = struct {
     }
 
     fn nextMessage(self: *WebSocket) !Message {
+        const msg = self.readMessageOrFail() catch |err| {
+            self.batch.endRound();
+            return err;
+        };
+        // A batch lasts while the peer's next message is already here.
+        self.batch.round(self.io, bufferedMessage(self.transport.reader.buffered()) != null);
+        return msg;
+    }
+
+    fn readMessageOrFail(self: *WebSocket) !Message {
         return self.readMessage() catch |err| switch (err) {
             // The reads inside can only report the sentinel; the transport
             // knows what actually happened.
@@ -194,27 +217,15 @@ pub const WebSocket = struct {
     }
 
     /// Whether `bytes` starts with a whole message, along with any control
-    /// frames before or inside it, and which kind.
-    fn bufferedMessage(bytes: []const u8) ?enum { data, close } {
+    /// frames before or inside it, and which kind. For a layer that frames
+    /// WebSocket messages itself (over HTTP/2, say) as much as for this one.
+    pub fn bufferedMessage(bytes: []const u8) ?enum { data, close } {
         var rest = bytes;
         while (true) {
-            if (rest.len < 2) return null;
+            const len = bufferedFrame(rest) orelse return null;
             const fin = rest[0] & 0x80 != 0;
             const opcode = rest[0] & 0x0F;
-            var header_len: usize = 2;
-            var payload_len: u64 = rest[1] & 0x7F;
-            if (payload_len == 126) {
-                if (rest.len < 4) return null;
-                payload_len = std.mem.readInt(u16, rest[2..4], .big);
-                header_len = 4;
-            } else if (payload_len == 127) {
-                if (rest.len < 10) return null;
-                payload_len = std.mem.readInt(u64, rest[2..10], .big);
-                header_len = 10;
-            }
-            if (rest[1] & 0x80 != 0) header_len += 4;
-            if (rest.len < header_len or rest.len - header_len < payload_len) return null;
-            rest = rest[header_len + @as(usize, @intCast(payload_len)) ..];
+            rest = rest[len..];
             if (opcode & 0x8 == 0) {
                 if (fin) return .data;
             } else if (opcode == @intFromEnum(MessageType.close)) {
@@ -223,19 +234,46 @@ pub const WebSocket = struct {
         }
     }
 
+    /// The length of the frame `bytes` starts with, when all of it is
+    /// there; null when it is not (or `bytes` is empty).
+    pub fn bufferedFrame(bytes: []const u8) ?usize {
+        if (bytes.len < 2) return null;
+        var header_len: usize = 2;
+        var payload_len: u64 = bytes[1] & 0x7F;
+        if (payload_len == 126) {
+            if (bytes.len < 4) return null;
+            payload_len = std.mem.readInt(u16, bytes[2..4], .big);
+            header_len = 4;
+        } else if (payload_len == 127) {
+            if (bytes.len < 10) return null;
+            payload_len = std.mem.readInt(u64, bytes[2..10], .big);
+            header_len = 10;
+        }
+        if (bytes[1] & 0x80 != 0) header_len += 4;
+        if (bytes.len < header_len or bytes.len - header_len < payload_len) return null;
+        return header_len + @as(usize, @intCast(payload_len));
+    }
+
     fn readMessage(self: *WebSocket) !Message {
         self.fragmented_data = .empty;
         self.fragmented_type = null;
         self.fragmented_compressed = false;
         while (true) {
+            // The batch ends where reading would wait for the peer: what
+            // it held goes out first.
+            if (self.batch.deferred.load(.monotonic) and bufferedFrame(self.transport.reader.buffered()) == null) {
+                try self.flushDeferred();
+            }
             const frame = try self.readFrame();
             // RSV1 marks a compressed message on its first frame only.
             if (frame.rsv1 and (frame.opcode != .text and frame.opcode != .binary)) return Error.ReservedFlags;
 
             switch (frame.opcode) {
                 .ping => {
-                    // Auto-respond with pong
-                    try self.writeFrame(.pong, frame.payload, true, true);
+                    // Auto-respond with pong, in the batch when the next
+                    // frame is here already.
+                    const after: Flush = if (self.autoflush and bufferedFrame(self.transport.reader.buffered()) != null) .batch else .now;
+                    try self.writeFrame(.pong, frame.payload, true, after);
                     self.auto_responded = true;
                     continue;
                 },
@@ -322,7 +360,15 @@ pub const WebSocket = struct {
     /// Send a text or binary message
     pub fn send(self: *WebSocket, msg_type: MessageType, data: []const u8) !void {
         if (msg_type != .text and msg_type != .binary) return Error.InvalidOpcode;
-        try self.writeFrame(msg_type, data, true, self.autoflush);
+        try self.writeFrame(msg_type, data, true, self.sendFlush());
+    }
+
+    /// When a frame `send` writes leaves: with `autoflush` off, when the
+    /// caller says; in a batch the calling task reads, with the batch;
+    /// otherwise now.
+    fn sendFlush(self: *WebSocket) Flush {
+        if (!self.autoflush) return .manual;
+        return if (self.batch.holds(self.io)) .batch else .now;
     }
 
     /// Sends `data`, already compressed by the negotiated extension, as one
@@ -333,13 +379,13 @@ pub const WebSocket = struct {
         try self.write_mutex.lock(self.io);
         defer self.write_mutex.unlock(self.io);
         if (self.closed) return error.EndOfStream;
-        return self.resolveWrite(self.writeFrameRsv(msg_type, data, true, self.autoflush, 0x40));
+        return self.resolveWrite(self.writeFrameRsv(msg_type, data, true, self.sendFlush(), 0x40));
     }
 
     /// Send a ping frame
     pub fn ping(self: *WebSocket, data: []const u8) !void {
         if (data.len > 125) return Error.LargeControlFrame;
-        try self.writeFrame(.ping, data, true, self.autoflush);
+        try self.writeFrame(.ping, data, true, self.sendFlush());
     }
 
     /// Write out whatever is left in the write buffer. Safe to call from
@@ -350,7 +396,28 @@ pub const WebSocket = struct {
         defer self.write_mutex.unlock(self.io);
         if (self.closed) return error.EndOfStream;
         errdefer self.closed = true;
-        return self.resolveWrite(self.transport.writer.flush());
+        try self.resolveWrite(self.transport.writer.flush());
+        self.batch.flushed();
+    }
+
+    /// Writes out what a batch held, if anything still holds it.
+    fn flushDeferred(self: *WebSocket) !void {
+        try self.write_mutex.lock(self.io);
+        defer self.write_mutex.unlock(self.io);
+        if (!self.batch.deferred.load(.monotonic) or self.closed) return;
+        errdefer self.closed = true;
+        try self.resolveWrite(self.transport.writer.flush());
+        self.batch.flushed();
+    }
+
+    /// The batch's backstop (`Batch.hold`).
+    fn flushHeld(batch: *Batch) std.Io.Cancelable!void {
+        const self: *WebSocket = @alignCast(@fieldParentPtr("batch", batch));
+        self.flushDeferred() catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            // The reader learns of it when its own read or write fails.
+            else => {},
+        };
     }
 
     /// Send close frame and mark connection as closed. Does nothing if a close
@@ -425,12 +492,7 @@ pub const WebSocket = struct {
         const payload = try self.msg_arena.allocator().alloc(u8, @intCast(payload_len));
         try self.transport.reader.readSliceAll(payload);
 
-        // Unmask if needed
-        if (masked) {
-            for (payload, 0..) |*byte, i| {
-                byte.* ^= mask_key[i % 4];
-            }
-        }
+        if (masked) applyMask(payload, mask_key);
 
         return .{
             .fin = fin,
@@ -448,18 +510,28 @@ pub const WebSocket = struct {
         };
     }
 
-    fn writeFrame(self: *WebSocket, opcode: MessageType, data: []const u8, fin: bool, flush_now: bool) !void {
+    /// What happens to the write buffer after a frame.
+    const Flush = enum {
+        /// Out now, with whatever else the buffer held.
+        now,
+        /// Held for the reading task's batch (`Batch`).
+        batch,
+        /// Left for `flush` (`autoflush` off).
+        manual,
+    };
+
+    fn writeFrame(self: *WebSocket, opcode: MessageType, data: []const u8, fin: bool, after: Flush) !void {
         try self.write_mutex.lock(self.io);
         defer self.write_mutex.unlock(self.io);
         if (self.closed) return error.EndOfStream;
-        return self.resolveWrite(self.writeFrameLocked(opcode, data, fin, flush_now));
+        return self.resolveWrite(self.writeFrameLocked(opcode, data, fin, after));
     }
 
-    fn writeFrameLocked(self: *WebSocket, opcode: MessageType, data: []const u8, fin: bool, flush_now: bool) std.Io.Writer.Error!void {
-        return self.writeFrameRsv(opcode, data, fin, flush_now, 0);
+    fn writeFrameLocked(self: *WebSocket, opcode: MessageType, data: []const u8, fin: bool, after: Flush) std.Io.Writer.Error!void {
+        return self.writeFrameRsv(opcode, data, fin, after, 0);
     }
 
-    fn writeFrameRsv(self: *WebSocket, opcode: MessageType, data: []const u8, fin: bool, flush_now: bool, rsv: u8) std.Io.Writer.Error!void {
+    fn writeFrameRsv(self: *WebSocket, opcode: MessageType, data: []const u8, fin: bool, after: Flush, rsv: u8) std.Io.Writer.Error!void {
         // A half-written frame leaves the peer unable to find the next frame
         // boundary.
         errdefer self.closed = true;
@@ -490,14 +562,31 @@ pub const WebSocket = struct {
             self.prng.random().bytes(&mask_key);
             try self.transport.writer.writeAll(&mask_key);
 
-            // XOR payload with mask key
-            for (data, 0..) |byte, i| {
-                try self.transport.writer.writeByte(byte ^ mask_key[i % 4]);
+            // XOR payload with mask key, a stack chunk at a time.
+            var chunk: [512]u8 = undefined;
+            var rest = data;
+            while (rest.len > 0) {
+                const n = @min(rest.len, chunk.len);
+                @memcpy(chunk[0..n], rest[0..n]);
+                applyMask(chunk[0..n], mask_key);
+                try self.transport.writer.writeAll(chunk[0..n]);
+                rest = rest[n..];
             }
         } else {
             try self.transport.writer.writeAll(data);
         }
-        if (flush_now) try self.transport.writer.flush();
+        switch (after) {
+            .now => {
+                try self.transport.writer.flush();
+                self.batch.flushed();
+            },
+            .batch => if (!self.batch.hold(self.io, flushHeld)) {
+                // No backstop to be had: out now, as without a batch.
+                try self.transport.writer.flush();
+                self.batch.flushed();
+            },
+            .manual => {},
+        }
     }
 
     fn writeClose(self: *WebSocket, code: CloseCode, reason: []const u8) !void {
@@ -510,7 +599,7 @@ pub const WebSocket = struct {
         std.mem.writeInt(u16, buf[0..2], @intFromEnum(code), .big);
         const reason_len = @min(reason.len, 123);
         @memcpy(buf[2..][0..reason_len], reason[0..reason_len]);
-        try self.resolveWrite(self.writeFrameLocked(.close, buf[0 .. 2 + reason_len], true, true));
+        try self.resolveWrite(self.writeFrameLocked(.close, buf[0 .. 2 + reason_len], true, .now));
     }
 
     /// Compute Sec-WebSocket-Accept value from client key
@@ -522,6 +611,138 @@ pub const WebSocket = struct {
         _ = std.base64.standard.Encoder.encode(out, &hash);
     }
 };
+
+/// One write per read: the frames the reading task sends while the peer's
+/// next message is already in the read buffer stay in the write buffer
+/// until the batch ends, when they go out together. A peer that sends
+/// sixteen messages before it reads the answers gets them in one write,
+/// not sixteen.
+///
+/// A batch belongs to the task that reads: `round`, as `receive` returns a
+/// message, starts or extends it when another whole message is buffered
+/// behind it, and ends it when none is. What it holds goes out at the
+/// latest
+///   - with the first frame its task sends once the batch has ended (the
+///     answer to the last buffered message takes the others along),
+///   - before a read would wait for the peer,
+///   - when another task sends or flushes, or the write buffer fills, or
+///   - when the reading task waits for anything else (a database, a timer,
+///     another lock): a backstop task on the reading task's executor,
+///     woken as each batch starts, flushes then. On zio's pinned executors
+///     it runs only once the reading task stops running, so a batch costs
+///     a wakeup, not a write. It is started with the socket's first batch
+///     and parked between batches, until `deinit`.
+/// Sends from any other task (a broadcast, say) never wait for a batch.
+///
+/// Shared with layers that frame WebSocket messages themselves (over
+/// HTTP/2 and HTTP/3): the owner gives it a backstop function and calls
+/// `flushed` under its write lock after every flush.
+pub const Batch = struct {
+    /// The reading task (`placement.taskId`) while the batch lasts; 0
+    /// when there is none.
+    owner: std.atomic.Value(usize) = .init(0),
+    /// Frames sit in the write buffer for the batch. Set by the reading
+    /// task, cleared by whichever flush sends them; both under the owner's
+    /// write lock.
+    deferred: std.atomic.Value(bool) = .init(false),
+    /// The backstop: one task, started with the first batch and parked
+    /// between batches on `wake`.
+    backstop: std.Io.Group = .init,
+    /// Set as a batch starts holding frames; the backstop waits on it.
+    wake: placement.Signal = .{},
+    /// The backstop task is running. Under the owner's write lock.
+    started: bool = false,
+    /// Off only for tests that count writes, where a backstop on another
+    /// thread (`std.Io.Threaded`) would flush at a moment of its choosing.
+    backstop_on: bool = true,
+
+    /// The reading task, as it hands a message on: `more` when another
+    /// whole message (or a close) is already buffered behind it.
+    pub fn round(self: *Batch, io: std.Io, more: bool) void {
+        self.owner.store(if (more) placement.taskId(io) else 0, .monotonic);
+    }
+
+    /// No batch: a read failed, or the reader is done.
+    pub fn endRound(self: *Batch) void {
+        self.owner.store(0, .monotonic);
+    }
+
+    /// Whether a frame the calling task sends belongs to the batch.
+    pub fn holds(self: *const Batch, io: std.Io) bool {
+        const owner = self.owner.load(.monotonic);
+        return owner != 0 and owner == placement.taskId(io);
+    }
+
+    /// Under the owner's write lock, with a frame left in the buffer for
+    /// the batch. The first frame of a batch wakes the backstop, which
+    /// calls `flushFn(self)` to flush what the batch still holds; the
+    /// first batch starts it. False when no task could be started for
+    /// it: the caller flushes now.
+    pub fn hold(self: *Batch, io: std.Io, comptime flushFn: fn (*Batch) std.Io.Cancelable!void) bool {
+        if (self.deferred.load(.monotonic)) return true;
+        self.deferred.store(true, .monotonic);
+        if (!self.backstop_on) return true;
+        if (!self.started) {
+            // A task kept for the socket's life rather than one per
+            // batch: waking a parked task costs a fraction of starting one.
+            placement.concurrent(&self.backstop, io, .local, Backstop(flushFn).run, .{ self, io }) catch {
+                self.deferred.store(false, .monotonic);
+                return false;
+            };
+            self.started = true;
+        }
+        self.wake.set(io);
+        return true;
+    }
+
+    fn Backstop(comptime flushFn: fn (*Batch) std.Io.Cancelable!void) type {
+        return struct {
+            fn run(self: *Batch, io: std.Io) std.Io.Cancelable!void {
+                while (true) {
+                    try self.wake.wait(io);
+                    // Before the flush, so a batch that starts during it
+                    // wakes this again.
+                    self.wake.reset(io);
+                    try flushFn(self);
+                }
+            }
+        };
+    }
+
+    /// Under the owner's write lock, after a flush: nothing is held.
+    pub fn flushed(self: *Batch) void {
+        self.deferred.store(false, .monotonic);
+    }
+
+    /// Stops the backstop. Before the owner goes away.
+    pub fn deinit(self: *Batch, io: std.Io) void {
+        self.backstop.cancel(io);
+    }
+};
+
+/// XORs `payload` with the 4-byte mask `key` (RFC 6455 §5.3), from the
+/// key's first byte: a vector at a time, the tail a word and then a byte
+/// at a time. About ten times the byte loop's speed from 64 bytes up.
+pub fn applyMask(payload: []u8, key: [4]u8) void {
+    const n = comptime @max(16, std.simd.suggestVectorLength(u8) orelse 16);
+    comptime std.debug.assert(n % 4 == 0);
+    const V = @Vector(n, u8);
+    var i: usize = 0;
+    if (payload.len >= n) {
+        const mask: V = @bitCast(@as(@Vector(n / 4, u32), @splat(@bitCast(key))));
+        while (payload.len - i >= n) : (i += n) {
+            const chunk: *[n]u8 = payload[i..][0..n];
+            chunk.* = @as(V, chunk.*) ^ mask;
+        }
+    }
+    // Then a word at a time, which also keeps a short message quick.
+    const word: u32 = @bitCast(key);
+    while (payload.len - i >= 4) : (i += 4) {
+        const w: *align(1) u32 = @ptrCast(payload[i..][0..4]);
+        w.* ^= word;
+    }
+    while (i < payload.len) : (i += 1) payload[i] ^= key[i % 4];
+}
 
 // Tests
 test "WebSocket: computeAcceptKey" {
@@ -538,7 +759,7 @@ test "WebSocket: writeFrame text" {
 
     var ws = WebSocket.init(std.testing.io, .{ .writer = &conn_writer, .reader = &reader }, std.testing.allocator, 0);
     defer ws.deinit();
-    try ws.writeFrame(.text, "Hello", true, true);
+    try ws.writeFrame(.text, "Hello", true, .now);
 
     const written = conn_writer.buffered();
     // FIN + text opcode
@@ -558,7 +779,7 @@ test "WebSocket: writeFrame binary with medium length" {
     defer ws.deinit();
 
     const payload = &@as([200]u8, @splat('x'));
-    try ws.writeFrame(.binary, payload, true, true);
+    try ws.writeFrame(.binary, payload, true, .now);
 
     const written = conn_writer.buffered();
     // FIN + binary opcode
@@ -872,7 +1093,7 @@ test "WebSocket: writeFrame masked (client mode)" {
     var ws = WebSocket.init(std.testing.io, .{ .writer = &conn_writer, .reader = &reader }, std.testing.allocator, 0);
     defer ws.deinit();
     ws.is_client = true;
-    try ws.writeFrame(.text, "Hello", true, true);
+    try ws.writeFrame(.text, "Hello", true, .now);
 
     const written = conn_writer.buffered();
     // FIN + text opcode
@@ -975,6 +1196,8 @@ const SocketProbe = struct {
     interface: std.Io.Writer,
     out: std.ArrayListUnmanaged(u8) = .empty,
     gpa: std.mem.Allocator,
+    /// How many writes reached the socket.
+    writes: usize = 0,
 
     fn init(gpa: std.mem.Allocator, buffer: []u8) SocketProbe {
         return .{
@@ -985,6 +1208,7 @@ const SocketProbe = struct {
 
     fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
         const self: *SocketProbe = @alignCast(@fieldParentPtr("interface", w));
+        self.writes += 1;
         self.out.appendSlice(self.gpa, w.buffered()) catch return error.WriteFailed;
         w.end = 0;
         var n: usize = 0;
@@ -1158,4 +1382,183 @@ test "WebSocket: RSV1 is passed on as compressed once allowed, and only on a dat
     try std.testing.expectEqual(@as(u8, 0xC1), out[0]);
     // RSV1 on a control frame is still an error.
     try std.testing.expectError(WebSocket.Error.ReservedFlags, ws2.receive());
+}
+
+/// A masked client frame (zero mask key, so the payload reads as is).
+fn maskedFrame(comptime opcode: u8, comptime payload: []const u8) [6 + payload.len]u8 {
+    return [_]u8{ 0x80 | opcode, 0x80 | @as(u8, payload.len), 0, 0, 0, 0 } ++ payload[0..payload.len].*;
+}
+
+test "WebSocket: messages read together are answered in one write" {
+    const gpa = std.testing.allocator;
+    var wbuf: [256]u8 = undefined;
+    var probe = SocketProbe.init(gpa, &wbuf);
+    defer probe.out.deinit(gpa);
+    const frames = maskedFrame(0x1, "a") ++ maskedFrame(0x1, "b") ++ maskedFrame(0x1, "c");
+    var reader: std.Io.Reader = undefined;
+    var ws = serverSocketOver(&frames, &reader, &probe.interface);
+    defer ws.deinit();
+    ws.batch.backstop_on = false;
+
+    for (0..3) |i| {
+        const msg = try ws.receive();
+        try ws.send(.text, msg.data);
+        // Held while the next message is here; the last answer takes all.
+        try std.testing.expectEqual(@as(usize, if (i < 2) 0 else 1), probe.writes);
+    }
+    try std.testing.expectEqualSlices(u8, &.{ 0x81, 1, 'a', 0x81, 1, 'b', 0x81, 1, 'c' }, probe.out.items);
+    try std.testing.expectError(error.EndOfStream, ws.receive());
+    try std.testing.expectEqual(@as(usize, 1), probe.writes);
+}
+
+test "WebSocket: a message not all here ends the batch, and held answers go out before receive waits" {
+    const gpa = std.testing.allocator;
+    var wbuf: [256]u8 = undefined;
+    var probe = SocketProbe.init(gpa, &wbuf);
+    defer probe.out.deinit(gpa);
+    // "a", "b", then half a frame.
+    const frames = maskedFrame(0x1, "a") ++ maskedFrame(0x1, "b") ++ [_]u8{ 0x81, 0x85, 0, 0 };
+    var reader: std.Io.Reader = undefined;
+    var ws = serverSocketOver(&frames, &reader, &probe.interface);
+    defer ws.deinit();
+    ws.batch.backstop_on = false;
+
+    _ = try ws.receive();
+    try ws.send(.text, "A");
+    try std.testing.expectEqual(@as(usize, 0), probe.writes);
+    // "b" is the last whole message: its handler sends nothing, and the
+    // next receive flushes "A" before it waits for the rest.
+    _ = try ws.receive();
+    try std.testing.expectEqual(@as(usize, 0), probe.writes);
+    try std.testing.expectError(error.EndOfStream, ws.receive());
+    try std.testing.expectEqual(@as(usize, 1), probe.writes);
+    try std.testing.expectEqualSlices(u8, &.{ 0x81, 1, 'A' }, probe.out.items);
+}
+
+test "WebSocket: a send from another task is not held by the reader's batch" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var wbuf: [256]u8 = undefined;
+    var probe = SocketProbe.init(gpa, &wbuf);
+    defer probe.out.deinit(gpa);
+    const frames = maskedFrame(0x1, "a") ++ maskedFrame(0x1, "b");
+    var reader: std.Io.Reader = undefined;
+    var ws = serverSocketOver(&frames, &reader, &probe.interface);
+    defer ws.deinit();
+    ws.batch.backstop_on = false;
+
+    _ = try ws.receive();
+    try ws.send(.text, "A");
+    try std.testing.expectEqual(@as(usize, 0), probe.writes);
+    var other = try io.concurrent(struct {
+        fn run(s: *WebSocket) !void {
+            try s.send(.text, "X");
+        }
+    }.run, .{&ws});
+    try other.await(io);
+    // Out at once, and the held "A" with it, ahead of it.
+    try std.testing.expectEqual(@as(usize, 1), probe.writes);
+    try std.testing.expectEqualSlices(u8, &.{ 0x81, 1, 'A', 0x81, 1, 'X' }, probe.out.items);
+}
+
+test "WebSocket: a pong in a batch keeps its place, and a close ends the batch" {
+    const gpa = std.testing.allocator;
+    var wbuf: [256]u8 = undefined;
+    var probe = SocketProbe.init(gpa, &wbuf);
+    defer probe.out.deinit(gpa);
+    const frames = maskedFrame(0x9, "p") ++ maskedFrame(0x1, "a") ++ maskedFrame(0x8, &.{ 0x03, 0xE8 });
+    var reader: std.Io.Reader = undefined;
+    var ws = serverSocketOver(&frames, &reader, &probe.interface);
+    defer ws.deinit();
+    ws.batch.backstop_on = false;
+
+    const msg = try ws.receive();
+    try std.testing.expectEqualStrings("a", msg.data);
+    try ws.send(.text, msg.data);
+    try std.testing.expectEqual(@as(usize, 0), probe.writes);
+    const close = try ws.receive();
+    try std.testing.expectEqual(.close, close.type);
+    try std.testing.expectEqual(@as(usize, 1), probe.writes);
+    try std.testing.expectEqualSlices(u8, &.{ 0x8A, 1, 'p', 0x81, 1, 'a', 0x88, 2, 0x03, 0xE8 }, probe.out.items);
+}
+
+test "WebSocket: what a batch holds goes out when the reader waits for something else" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var wbuf: [256]u8 = undefined;
+    var probe = SocketProbe.init(gpa, &wbuf);
+    defer probe.out.deinit(gpa);
+    const frames = maskedFrame(0x1, "a") ++ maskedFrame(0x1, "b");
+    var reader: std.Io.Reader = undefined;
+    var ws = serverSocketOver(&frames, &reader, &probe.interface);
+    defer ws.deinit();
+
+    _ = try ws.receive();
+    try ws.send(.text, "A");
+    // The handler goes off to wait for something, "b" still unread: the
+    // backstop sends "A" meanwhile.
+    var waited: usize = 0;
+    while (probe.writes == 0 and waited < 5000) : (waited += 1) {
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try ws.write_mutex.lock(io);
+    defer ws.write_mutex.unlock(io);
+    try std.testing.expectEqualSlices(u8, &.{ 0x81, 1, 'A' }, probe.out.items);
+}
+
+test "applyMask: matches the byte-by-byte XOR at every length and through the tail" {
+    var prng = std.Random.DefaultPrng.init(7);
+    const random = prng.random();
+    var buf: [300]u8 = undefined;
+    var expected: [300]u8 = undefined;
+    for (0..buf.len) |len| {
+        var key: [4]u8 = undefined;
+        random.bytes(&key);
+        random.bytes(buf[0..len]);
+        for (buf[0..len], expected[0..len], 0..) |b, *e, i| e.* = b ^ key[i % 4];
+        applyMask(buf[0..len], key);
+        try std.testing.expectEqualSlices(u8, expected[0..len], buf[0..len]);
+    }
+}
+
+test "WebSocket: a long payload masked by the client reads back on the server" {
+    const gpa = std.testing.allocator;
+    var payload: [1500]u8 = undefined;
+    for (&payload, 0..) |*b, i| b.* = @truncate(i *% 31);
+    var buf: [2048]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var none: std.Io.Reader = .fixed("");
+    var client = WebSocket.init(std.testing.io, .{ .writer = &w, .reader = &none }, gpa, 3);
+    defer client.deinit();
+    client.is_client = true;
+    try client.send(.binary, &payload);
+
+    var r: std.Io.Reader = .fixed(w.buffered());
+    var out: [16]u8 = undefined;
+    var ow: std.Io.Writer = .fixed(&out);
+    var server = WebSocket.init(std.testing.io, .{ .writer = &ow, .reader = &r }, gpa, 4);
+    defer server.deinit();
+    const msg = try server.receive();
+    try std.testing.expectEqualSlices(u8, &payload, msg.data);
+}
+
+test "WebSocket: the answers to what receiveMany returns leave in one write" {
+    const gpa = std.testing.allocator;
+    var wbuf: [256]u8 = undefined;
+    var probe = SocketProbe.init(gpa, &wbuf);
+    defer probe.out.deinit(gpa);
+    const frames = maskedFrame(0x1, "a") ++ maskedFrame(0x1, "b") ++ maskedFrame(0x1, "c");
+    var reader: std.Io.Reader = undefined;
+    var ws = serverSocketOver(&frames, &reader, &probe.interface);
+    defer ws.deinit();
+    ws.batch.backstop_on = false;
+
+    const msgs = try ws.receiveMany();
+    try std.testing.expectEqual(@as(usize, 3), msgs.len);
+    for (msgs) |m| try ws.send(.text, m.data);
+    try std.testing.expectEqual(@as(usize, 0), probe.writes);
+    // Out before the next call waits for the peer.
+    try std.testing.expectError(error.EndOfStream, ws.receiveMany());
+    try std.testing.expectEqual(@as(usize, 1), probe.writes);
+    try std.testing.expectEqualSlices(u8, &.{ 0x81, 1, 'a', 0x81, 1, 'b', 0x81, 1, 'c' }, probe.out.items);
 }
