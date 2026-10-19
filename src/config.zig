@@ -340,6 +340,12 @@ pub const ServerConfig = struct {
         /// GET, as the HTTP/1.1 upgrade it replaces does, with
         /// `Request.protocol` set.
         enable_connect_protocol: bool = true,
+        /// Requests for routes registered `no_wait` (`RouteOptions`) that
+        /// arrive whole (END_STREAM on their HEADERS) run on the
+        /// connection's reader, right after the read that brought them,
+        /// rather than on a task each: no task to start, switch to and
+        /// tear down, and their responses go out in the read's one write.
+        inline_no_wait: bool = true,
     };
 
     pub const Timeout = struct {

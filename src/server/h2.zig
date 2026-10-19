@@ -172,6 +172,12 @@ pub fn Engine(comptime Ctx: type) type {
             /// Set while the reader runs the session, so a stream whose head
             /// completes can be handed to a task in the connection's group.
             group: ?*std.Io.Group = null,
+            /// Requests of `no_wait` routes that arrived whole, for the
+            /// reader to run once the session has taken the read. Only the
+            /// reader touches it.
+            ready: std.ArrayList(*Stream) = .empty,
+            /// The server has `no_wait` routes and runs them inline.
+            inline_ok: bool = false,
             /// The reader is done; the writer sends what is left and exits.
             closing: bool = false,
             /// A GOAWAY went out because the server is draining.
@@ -329,6 +335,12 @@ pub fn Engine(comptime Ctx: type) type {
             status: http.Status = .ok,
             response_nv: []c.nghttp2_nv = &.{},
             submitted: bool = false,
+            /// The handler runs on the connection's reader (a `no_wait`
+            /// route), which must never wait for the writer: its body goes
+            /// to `backlog`, which grows as needed, instead of the queue.
+            inline_mode: bool = false,
+            backlog: std.ArrayList(u8) = .empty,
+            backlog_pos: usize = 0,
             /// Response body: the handler in, the data provider out.
             out: ?std.Io.Queue(u8) = null,
             /// Or a whole body in memory (`StreamSink.complete`), which the
@@ -441,7 +453,9 @@ pub fn Engine(comptime Ctx: type) type {
                 .io = server.io,
                 .allocator = server.allocator,
                 .config = server.config.http2,
+                .inline_ok = server.config.http2.inline_no_wait and server.router.has_no_wait,
             };
+            defer conn.ready.deinit(conn.allocator);
             try conn.initSession();
             server.h2_conns.add(&conn);
             defer {
@@ -540,6 +554,9 @@ pub fn Engine(comptime Ctx: type) type {
                         break :consumed @as(usize, @intCast(rv));
                     };
                     reader.toss(consumed);
+                    // The requests that run inline answer before the one
+                    // kick, so their responses share the next write.
+                    if (conn.ready.items.len > 0) try runInline(conn);
                     conn.kickWriter();
 
                     conn.lock();
@@ -711,33 +728,62 @@ pub fn Engine(comptime Ctx: type) type {
                 log.debug("HTTP/2 stream {d} reset before its handler started", .{stream.id});
                 return;
             }
-            serveStream(conn, stream) catch |err| {
-                if (err == error.Canceled) {
-                    conn.lock();
-                    const reset = stream.reset;
-                    conn.unlock();
-                    // Canceled because the peer reset the stream or the
-                    // connection went away: the stream is over already.
-                    if (reset) {
-                        log.debug("HTTP/2 stream {d}: handler canceled, the stream was reset", .{stream.id});
-                        return;
-                    }
-                    resetStream(conn, stream, c.NGHTTP2_CANCEL);
-                    return error.Canceled;
+            serveStream(conn, stream, false) catch |err| return streamFailed(conn, stream, err);
+        }
+
+        /// Runs the requests `onFrameRecv` set aside for the reader
+        /// (`no_wait` routes), in the order they arrived.
+        fn runInline(conn: *Conn) error{Canceled}!void {
+            defer conn.ready.clearRetainingCapacity();
+            for (conn.ready.items) |stream| {
+                conn.lock();
+                const gone = stream.reset;
+                conn.unlock();
+                var canceled = false;
+                if (!gone) {
+                    serveStream(conn, stream, true) catch |err| {
+                        streamFailed(conn, stream, err) catch {
+                            canceled = true;
+                        };
+                    };
                 }
-                // `Response.abort`: the reset is the abort.
-                if (err == error.ResponseAborted) {
-                    log.debug("HTTP/2 stream {d}: response aborted", .{stream.id});
-                    resetStream(conn, stream, c.NGHTTP2_CANCEL);
+                conn.lock();
+                stream.release(.handler);
+                conn.unlock();
+                // The reader itself is canceled: the connection is going.
+                if (canceled) return error.Canceled;
+            }
+        }
+
+        /// What a handler's error means for its stream. `error.Canceled`
+        /// when the handler's own task was canceled for another reason
+        /// than the stream's reset, to pass on.
+        fn streamFailed(conn: *Conn, stream: *Stream, err: anyerror) error{Canceled}!void {
+            if (err == error.Canceled) {
+                conn.lock();
+                const reset = stream.reset;
+                conn.unlock();
+                // Canceled because the peer reset the stream or the
+                // connection went away: the stream is over already.
+                if (reset) {
+                    log.debug("HTTP/2 stream {d}: handler canceled, the stream was reset", .{stream.id});
                     return;
                 }
-                if (stream.reset or err == error.ConnectionResetByPeer) {
-                    log.debug("HTTP/2 stream {d} reset: {}", .{ stream.id, err });
-                } else {
-                    log.err("HTTP/2 stream {d}: {}", .{ stream.id, err });
-                    resetStream(conn, stream, c.NGHTTP2_INTERNAL_ERROR);
-                }
-            };
+                resetStream(conn, stream, c.NGHTTP2_CANCEL);
+                return error.Canceled;
+            }
+            // `Response.abort`: the reset is the abort.
+            if (err == error.ResponseAborted) {
+                log.debug("HTTP/2 stream {d}: response aborted", .{stream.id});
+                resetStream(conn, stream, c.NGHTTP2_CANCEL);
+                return;
+            }
+            if (stream.reset or err == error.ConnectionResetByPeer) {
+                log.debug("HTTP/2 stream {d} reset: {}", .{ stream.id, err });
+            } else {
+                log.err("HTTP/2 stream {d}: {}", .{ stream.id, err });
+                resetStream(conn, stream, c.NGHTTP2_INTERNAL_ERROR);
+            }
         }
 
         fn resetStream(conn: *Conn, stream: *Stream, code: u32) void {
@@ -749,14 +795,17 @@ pub fn Engine(comptime Ctx: type) type {
             conn.kickWriter();
         }
 
-        fn serveStream(conn: *Conn, stream: *Stream) !void {
+        /// Serves one request. `inline_mode`: on the connection's reader
+        /// (a `no_wait` route), with no request timeout, whose timer would
+        /// cancel the reader.
+        fn serveStream(conn: *Conn, stream: *Stream, inline_mode: bool) !void {
             const server = conn.server;
             const arena = stream.arena.allocator();
             const io = conn.io;
 
             var timer: Timer = .init(null);
             defer timer.clear(io);
-            if (server.config.timeout.request) |d| timer.set(io, .{ .duration = .{ .raw = d, .clock = .awake } });
+            if (!inline_mode) if (server.config.timeout.request) |d| timer.set(io, .{ .duration = .{ .raw = d, .clock = .awake } });
 
             var request: Request = .{
                 .arena = arena,
@@ -771,8 +820,8 @@ pub fn Engine(comptime Ctx: type) type {
                 .version_minor = 0,
                 .drain = &server.draining,
                 .drain_hooks = &server.drain_hooks,
-                ._timeout_context = &timer,
-                ._set_timeout = setTimeout,
+                ._timeout_context = if (inline_mode) null else &timer,
+                ._set_timeout = if (inline_mode) null else setTimeout,
             };
             var body_reader: BodyReader = .init(stream);
             request.body_source = .{ .reader = &body_reader.interface, .err = BodyReader.errorOf };
@@ -1105,7 +1154,7 @@ pub fn Engine(comptime Ctx: type) type {
                 {
                     conn.lock();
                     defer conn.unlock();
-                    if (stream.out == null) {
+                    if (stream.out == null and !stream.inline_mode) {
                         const buf = stream.arena.allocator().alloc(u8, out_queue_len) catch return self.fail(error.SystemResources);
                         stream.out = .init(buf);
                     }
@@ -1124,7 +1173,7 @@ pub fn Engine(comptime Ctx: type) type {
                 {
                     conn.lock();
                     defer conn.unlock();
-                    if (stream.out == null) {
+                    if (stream.out == null and !stream.inline_mode) {
                         const buf = stream.arena.allocator().alloc(u8, out_queue_len) catch return self.fail(error.SystemResources);
                         stream.out = .init(buf);
                     }
@@ -1151,6 +1200,18 @@ pub fn Engine(comptime Ctx: type) type {
                 if (bytes.len == 0) return;
                 const stream = self.stream;
                 const conn = stream.conn;
+                if (stream.inline_mode) {
+                    // On the reader: never wait for the writer, which may
+                    // need the reader to take a WINDOW_UPDATE first. The
+                    // reader kicks the writer when its inline requests are
+                    // done.
+                    conn.lock();
+                    defer conn.unlock();
+                    if (stream.reset) return self.fail(error.ConnectionResetByPeer);
+                    stream.backlog.appendSlice(stream.arena.allocator(), bytes) catch return self.fail(error.SystemResources);
+                    _ = c.nghttp2_session_resume_data(conn.session, stream.id);
+                    return;
+                }
                 var rest = bytes;
                 while (rest.len > 0) {
                     // At most a queue's worth at a time, so the provider is
@@ -1178,6 +1239,12 @@ pub fn Engine(comptime Ctx: type) type {
                 stream.ended = true;
                 if (stream.out) |*q| {
                     q.close(conn.io);
+                    _ = c.nghttp2_session_resume_data(conn.session, stream.id);
+                    conn.kickWriter();
+                    return;
+                }
+                // An inline stream's body went out through its backlog.
+                if (stream.submitted) {
                     _ = c.nghttp2_session_resume_data(conn.session, stream.id);
                     conn.kickWriter();
                     return;
@@ -1366,7 +1433,9 @@ pub fn Engine(comptime Ctx: type) type {
                 c.NGHTTP2_HEADERS => {
                     if (frame.*.headers.cat == c.NGHTTP2_HCAT_REQUEST) {
                         if (end_stream) stream.closeBody();
-                        startStream(conn, stream);
+                        if (end_stream and conn.inline_ok and noWaitRoute(conn, stream)) {
+                            queueInline(conn, stream);
+                        } else startStream(conn, stream);
                     } else if (end_stream) {
                         stream.closeBody(); // trailers end the body
                     }
@@ -1392,6 +1461,25 @@ pub fn Engine(comptime Ctx: type) type {
                 stream.release(.handler);
                 _ = c.nghttp2_submit_rst_stream(conn.session, c.NGHTTP2_FLAG_NONE, stream.id, c.NGHTTP2_REFUSED_STREAM);
             };
+        }
+
+        /// Whether the request's route was registered `no_wait`. An
+        /// extended CONNECT never is: it is a tunnel, whatever it routes as.
+        fn noWaitRoute(conn: *Conn, stream: *Stream) bool {
+            const method = parseMethod(stream.method) orelse return false;
+            if (method == .connect) return false;
+            return conn.server.router.noWait(method, stream.path);
+        }
+
+        /// The head is complete, the request whole and its route `no_wait`:
+        /// count the stream in flight and leave it for the reader to run
+        /// (`runInline`) once the session has taken the read.
+        fn queueInline(conn: *Conn, stream: *Stream) void {
+            conn.ready.append(conn.allocator, stream) catch return startStream(conn, stream);
+            _ = conn.server.busy.fetchAdd(.{ .count = 1 }, .acq_rel);
+            conn.open_streams += 1;
+            stream.counted = true;
+            stream.inline_mode = true;
         }
 
         /// Notes when the frame that ends a response is out. If the handler
@@ -1521,6 +1609,22 @@ pub fn Engine(comptime Ctx: type) type {
                 // empty queue is the end of the body.
                 if (n > 0) {
                     if (stream.ended and q.type_erased.len == 0) return finish(session, stream_id, stream, data_flags, n);
+                    return @intCast(n);
+                }
+                if (!stream.ended) return c.NGHTTP2_ERR_DEFERRED;
+                return finish(session, stream_id, stream, data_flags, 0);
+            }
+            if (stream.inline_mode and stream.parts.len == 0) {
+                const pending = stream.backlog.items[stream.backlog_pos..];
+                const n = @min(pending.len, length);
+                @memcpy(buf[0..n], pending[0..n]);
+                stream.backlog_pos += n;
+                if (stream.backlog_pos == stream.backlog.items.len) {
+                    stream.backlog.clearRetainingCapacity();
+                    stream.backlog_pos = 0;
+                }
+                if (n > 0) {
+                    if (stream.ended and stream.backlog.items.len == 0) return finish(session, stream_id, stream, data_flags, n);
                     return @intCast(n);
                 }
                 if (!stream.ended) return c.NGHTTP2_ERR_DEFERRED;

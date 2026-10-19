@@ -31,6 +31,10 @@ const TestClient = struct {
     /// The last-stream-ID of each GOAWAY received, in order.
     goaways: [4]i32 = undefined,
     goaway_count: usize = 0,
+    /// DATA frames received with no payload and END_STREAM: an end that
+    /// could have gone on the frame before it.
+    empty_ends: usize = 0,
+    closes: usize = 0,
 
     const Resp = struct {
         status: u16 = 0,
@@ -39,6 +43,8 @@ const TestClient = struct {
         body: std.ArrayList(u8) = .empty,
         trailer: ?[]u8 = null,
         closed: bool = false,
+        /// When it closed: 1 for the first stream of the client to close.
+        close_seq: usize = 0,
         error_code: u32 = 0,
         /// The request body to send, if any.
         send: []const u8 = "",
@@ -199,6 +205,7 @@ const TestClient = struct {
 
     fn onFrame(_: ?*c.nghttp2_session, frame: [*c]const c.nghttp2_frame, user_data: ?*anyopaque) callconv(.c) c_int {
         const self: *TestClient = @ptrCast(@alignCast(user_data.?));
+        if (frame.*.hd.type == c.NGHTTP2_DATA and frame.*.hd.length == 0 and frame.*.hd.flags & c.NGHTTP2_FLAG_END_STREAM != 0) self.empty_ends += 1;
         if (frame.*.hd.type == c.NGHTTP2_GOAWAY and self.goaway_count < self.goaways.len) {
             self.goaways[self.goaway_count] = frame.*.goaway.last_stream_id;
             self.goaway_count += 1;
@@ -228,8 +235,11 @@ const TestClient = struct {
         }
     }
 
-    fn onClose(session: ?*c.nghttp2_session, id: i32, error_code: u32, _: ?*anyopaque) callconv(.c) c_int {
+    fn onClose(session: ?*c.nghttp2_session, id: i32, error_code: u32, user_data: ?*anyopaque) callconv(.c) c_int {
+        const self: *TestClient = @ptrCast(@alignCast(user_data.?));
         const resp = respFor(session, id) orelse return 0;
+        self.closes += 1;
+        resp.close_seq = self.closes;
         resp.closed = true;
         resp.error_code = error_code;
         return 0;
@@ -283,6 +293,14 @@ const Handlers = struct {
         try req.io.sleep(.fromMilliseconds(300), .awake);
         res.body = "slow but whole";
     }
+    /// A streamed body far past the client's 64 KiB stream window.
+    fn big(_: *dusty.Request, res: *dusty.Response) !void {
+        var buf: [4096]u8 = undefined;
+        var out = try res.stream(&buf);
+        for (0..big_len / 1000) |i| try out.interface.print("{d:0>999}\n", .{i});
+        try out.end();
+    }
+    const big_len = 1000 * 1000;
 };
 
 const Fixture = struct {
@@ -299,6 +317,14 @@ const Fixture = struct {
         self.server.router.get("/trailers", Handlers.trailers);
         self.server.router.post("/ignore", Handlers.ignoreBody);
         self.server.router.get("/slow", Handlers.slow);
+        // The same handlers on routes that promise not to wait, which run
+        // on the connection's reader when their request comes whole.
+        self.server.router.addRouteWith(.get, "/nw/hello", Handlers.hello, .{ .no_wait = true });
+        self.server.router.addRouteWith(.get, "/nw/users/:id", Handlers.user, .{ .no_wait = true });
+        self.server.router.addRouteWith(.get, "/nw/trailers", Handlers.trailers, .{ .no_wait = true });
+        self.server.router.addRouteWith(.get, "/nw/big", Handlers.big, .{ .no_wait = true });
+        self.server.router.addRouteWith(.post, "/nw/echo", Handlers.echo, .{ .no_wait = true });
+        self.server.router.addRouteWith(.get, "/nw/slow", Handlers.slow, .{ .no_wait = true });
         self.future = try io.concurrent(run, .{&self.server});
         try self.server.waitReady(io);
     }
@@ -334,6 +360,96 @@ test "HTTP/2: GET over prior-knowledge h2c reaches the router" {
     try std.testing.expectEqualStrings("5", client.get(head).content_length.?);
     try std.testing.expectEqualStrings("", client.get(head).body.items);
     try std.testing.expectEqual(@as(u16, 404), client.get(missing).status);
+}
+
+test "HTTP/2: a whole body ends on its DATA frame, an empty one on HEADERS" {
+    const io = std.testing.io;
+    var fx: Fixture = undefined;
+    try fx.start(io);
+    defer fx.stop(io);
+
+    var client: TestClient = undefined;
+    try client.init(std.testing.allocator, io, fx.server.address.ip);
+    defer client.deinit();
+    const ok = try client.request("GET", "/hello", null);
+    const head = try client.request("HEAD", "/hello", null);
+    const inline_ok = try client.request("GET", "/nw/hello", null);
+    try client.run();
+    try std.testing.expectEqualStrings("hello", client.get(ok).body.items);
+    try std.testing.expectEqualStrings("hello", client.get(inline_ok).body.items);
+    try std.testing.expectEqual(@as(u16, 200), client.get(head).status);
+    try std.testing.expectEqual(@as(usize, 0), client.empty_ends);
+}
+
+test "HTTP/2: no_wait routes answer from the reader, beside tasks, past the window" {
+    const io = std.testing.io;
+    var fx: Fixture = undefined;
+    try fx.start(io);
+    defer fx.stop(io);
+    try std.testing.expect(fx.server.router.has_no_wait);
+
+    const body = try std.testing.allocator.alloc(u8, 300 * 1024 + 7);
+    defer std.testing.allocator.free(body);
+    for (body, 0..) |*b, i| b.* = @truncate(i *% 13);
+
+    var client: TestClient = undefined;
+    try client.init(std.testing.allocator, io, fx.server.address.ip);
+    defer client.deinit();
+    var ids: [16]i32 = undefined;
+    var paths: [16][16]u8 = undefined;
+    for (&ids, 0..) |*id, i| {
+        const path = try std.fmt.bufPrint(&paths[i], "/nw/users/{d}", .{i});
+        id.* = try client.request("GET", path, null);
+    }
+    const task = try client.request("GET", "/users/x", null);
+    const trailers = try client.request("GET", "/nw/trailers", null);
+    // Streamed from the reader far past the client's stream window: the
+    // reader must not wait for the writer, which waits for WINDOW_UPDATEs
+    // only the reader takes in.
+    const big = try client.request("GET", "/nw/big", null);
+    // With a body: not whole on its HEADERS, so it gets a task.
+    const echoed = try client.request("POST", "/nw/echo", body);
+    const head = try client.request("HEAD", "/nw/hello", null);
+    const query = try client.request("GET", "/nw/hello?x=1", null);
+    try client.run();
+
+    for (ids, 0..) |id, i| {
+        var expect: [16]u8 = undefined;
+        try std.testing.expectEqualStrings(try std.fmt.bufPrint(&expect, "user {d}", .{i}), client.get(id).body.items);
+    }
+    try std.testing.expectEqualStrings("user x", client.get(task).body.items);
+    try std.testing.expectEqualStrings("with trailers", client.get(trailers).body.items);
+    try std.testing.expectEqualStrings("yes", client.get(trailers).trailer.?);
+    try std.testing.expectEqual(@as(usize, Handlers.big_len), client.get(big).body.items.len);
+    try std.testing.expect(std.mem.endsWith(u8, client.get(big).body.items, "999\n"));
+    try std.testing.expect(std.mem.eql(u8, body, client.get(echoed).body.items));
+    try std.testing.expectEqualStrings("5", client.get(head).content_length.?);
+    try std.testing.expectEqualStrings("", client.get(head).body.items);
+    try std.testing.expectEqualStrings("hello", client.get(query).body.items);
+}
+
+test "HTTP/2: a no_wait handler that waits anyway still answers, holding up its connection" {
+    const io = std.testing.io;
+    var fx: Fixture = undefined;
+    try fx.start(io);
+    defer fx.stop(io);
+
+    var client: TestClient = undefined;
+    try client.init(std.testing.allocator, io, fx.server.address.ip);
+    defer client.deinit();
+    const slow = try client.request("GET", "/nw/slow", null);
+    const hello = try client.request("GET", "/nw/hello", null);
+    try client.run();
+    try std.testing.expectEqualStrings("slow but whole", client.get(slow).body.items);
+    try std.testing.expectEqualStrings("hello", client.get(hello).body.items);
+    // Run in turn on the reader, so the quick one waited for the slow one.
+    try std.testing.expect(client.get(slow).close_seq < client.get(hello).close_seq);
+
+    // On tasks, the quick one does not wait.
+    const slow_task = try client.request("GET", "/slow", null);
+    const hello_task = try client.request("GET", "/hello", null);
+    try client.run();
+    try std.testing.expect(client.get(hello_task).close_seq < client.get(slow_task).close_seq);
 }
 
 test "HTTP/2: many streams multiplexed on one connection" {

@@ -51,6 +51,23 @@ const Node = struct {
     route: ?*const anyopaque,
 };
 
+/// How a route is registered (`Router.addRouteWith`).
+pub const RouteOptions = struct {
+    /// Whatever the route is registered with, for its handler to read back
+    /// as `req.route.?.data`; see `Router.addRoute`.
+    data: ?*const anyopaque = null,
+    /// The handler and every middleware that runs for it never wait: no
+    /// I/O, no sleeping, no lock or event that another task releases, no
+    /// request body. A protocol engine that runs each request on a task of
+    /// its own may then run this route's requests that arrived whole right
+    /// where it reads them, without a task (HTTP/2 does, for requests that
+    /// end with their HEADERS). A handler that waits anyway still works,
+    /// but holds up every other request on its connection meanwhile, and
+    /// gets no request timeout. Leave it off for anything that talks to a
+    /// database, a cache, another service or the file system.
+    no_wait: bool = false,
+};
+
 pub fn Action(comptime Ctx: type) type {
     return *const Router(Ctx).Handler;
 }
@@ -68,6 +85,8 @@ pub fn Router(comptime Ctx: type) type {
             info: RouteInfo,
             action: *const Handler,
             middlewares: []const Middleware(Ctx),
+            /// See `RouteOptions.no_wait`.
+            no_wait: bool = false,
         };
 
         /// One method's route in `static_routes`; the methods for one path
@@ -95,6 +114,8 @@ pub fn Router(comptime Ctx: type) type {
         /// A route was registered: each route took a copy of the global
         /// middleware then, so adding more now would miss them.
         has_routes: bool = false,
+        /// Some route was registered with `no_wait`.
+        has_no_wait: bool = false,
 
         pub fn init(allocator: std.mem.Allocator) Self {
             return .{
@@ -169,9 +190,10 @@ pub fn Router(comptime Ctx: type) type {
             method: ?Method,
             handler: *const Handler,
             middlewares: []const Middleware(Ctx),
-            data: ?*const anyopaque,
+            opts: RouteOptions,
         ) !void {
             self.has_routes = true;
+            if (opts.no_wait) self.has_no_wait = true;
             if (self.findConflict(path, method)) |c| {
                 std.debug.panic("route {s} {s} conflicts with any() route {s}: both match some paths, but {s} is not more specific", .{ c.method.name(), c.method_path, c.any_path, c.method_path });
             }
@@ -262,9 +284,10 @@ pub fn Router(comptime Ctx: type) type {
             const alloc = self.arena.allocator();
             const route = try alloc.create(Route);
             route.* = .{
-                .info = .{ .path = try alloc.dupe(u8, path), .data = data },
+                .info = .{ .path = try alloc.dupe(u8, path), .data = opts.data },
                 .action = handler,
                 .middlewares = middlewares,
+                .no_wait = opts.no_wait,
             };
             current.route = @ptrCast(route);
 
@@ -491,35 +514,35 @@ pub fn Router(comptime Ctx: type) type {
         }
 
         pub fn get(self: *Self, path: []const u8, handler: Handler) void {
-            self.insertRoute(path, .get, handler, self.middlewares, null) catch @panic("OOM");
+            self.insertRoute(path, .get, handler, self.middlewares, .{}) catch @panic("OOM");
         }
 
         pub fn head(self: *Self, path: []const u8, handler: Handler) void {
-            self.insertRoute(path, .head, handler, self.middlewares, null) catch @panic("OOM");
+            self.insertRoute(path, .head, handler, self.middlewares, .{}) catch @panic("OOM");
         }
 
         pub fn post(self: *Self, path: []const u8, handler: Handler) void {
-            self.insertRoute(path, .post, handler, self.middlewares, null) catch @panic("OOM");
+            self.insertRoute(path, .post, handler, self.middlewares, .{}) catch @panic("OOM");
         }
 
         pub fn put(self: *Self, path: []const u8, handler: Handler) void {
-            self.insertRoute(path, .put, handler, self.middlewares, null) catch @panic("OOM");
+            self.insertRoute(path, .put, handler, self.middlewares, .{}) catch @panic("OOM");
         }
 
         pub fn delete(self: *Self, path: []const u8, handler: Handler) void {
-            self.insertRoute(path, .delete, handler, self.middlewares, null) catch @panic("OOM");
+            self.insertRoute(path, .delete, handler, self.middlewares, .{}) catch @panic("OOM");
         }
 
         pub fn patch(self: *Self, path: []const u8, handler: Handler) void {
-            self.insertRoute(path, .patch, handler, self.middlewares, null) catch @panic("OOM");
+            self.insertRoute(path, .patch, handler, self.middlewares, .{}) catch @panic("OOM");
         }
 
         pub fn options(self: *Self, path: []const u8, handler: Handler) void {
-            self.insertRoute(path, .options, handler, self.middlewares, null) catch @panic("OOM");
+            self.insertRoute(path, .options, handler, self.middlewares, .{}) catch @panic("OOM");
         }
 
         pub fn query(self: *Self, path: []const u8, handler: Handler) void {
-            self.insertRoute(path, .query, handler, self.middlewares, null) catch @panic("OOM");
+            self.insertRoute(path, .query, handler, self.middlewares, .{}) catch @panic("OOM");
         }
 
         /// Registers `handler` for `method` (null: every method, as `any`)
@@ -528,7 +551,54 @@ pub fn Router(comptime Ctx: type) type {
         /// same function for several routes or registrations. `data` must
         /// outlive the router.
         pub fn addRoute(self: *Self, method: ?Method, path: []const u8, handler: Handler, data: ?*const anyopaque) void {
-            self.insertRoute(path, method, handler, self.middlewares, data) catch @panic("OOM");
+            self.insertRoute(path, method, handler, self.middlewares, .{ .data = data }) catch @panic("OOM");
+        }
+
+        /// Registers `handler` for `method` (null: every method, as `any`)
+        /// with `opts`.
+        pub fn addRouteWith(self: *Self, method: ?Method, path: []const u8, handler: Handler, opts: RouteOptions) void {
+            self.insertRoute(path, method, handler, self.middlewares, opts) catch @panic("OOM");
+        }
+
+        /// Whether the route a request for `method` and `url` would get was
+        /// registered `no_wait`: the same route `findHandler` picks, found
+        /// without touching a request. False when no route matches.
+        pub fn noWait(self: *const Self, method: Method, url: []const u8) bool {
+            if (!self.has_no_wait) return false;
+            const path = if (std.mem.indexOfScalar(u8, url, '?')) |q| url[0..q] else url;
+            if (self.staticRoute(method, path)) |r| return r.no_wait;
+            const found = self.peekIn(method, path) orelse
+                (if (method == .head) self.peekIn(.get, path) else null) orelse
+                self.peekIn(null, path) orelse return false;
+            return found.no_wait;
+        }
+
+        /// `matchIn` without capturing parameters.
+        fn peekIn(self: *const Self, method: ?Method, path: []const u8) ?*const Route {
+            const root = (if (method) |m| self.trees[@intFromEnum(m)] else self.any_tree) orelse return null;
+            const node = peekRecursive(root, path, 0) orelse return null;
+            const opaque_route = node.route orelse return null;
+            return @ptrCast(@alignCast(opaque_route));
+        }
+
+        /// `matchRecursive` over the path's segments from `start`, in the
+        /// same order (static, then parameter, then wildcard), recording
+        /// nothing.
+        fn peekRecursive(node: *Node, path: []const u8, start: usize) ?*Node {
+            var i = start;
+            while (i < path.len and path[i] == '/') i += 1;
+            if (i >= path.len) return if (node.route != null) node else null;
+            const end = std.mem.indexOfScalarPos(u8, path, i, '/') orelse path.len;
+            const segment = path[i..end];
+            var child = node.static_children;
+            while (child) |c| : (child = c.next_sibling) {
+                if (std.mem.eql(u8, c.segment, segment)) {
+                    if (peekRecursive(c, path, end)) |found| return found;
+                }
+            }
+            if (node.param_child) |c| if (peekRecursive(c, path, end)) |found| return found;
+            if (node.wildcard_child) |c| return c;
+            return null;
         }
 
         /// Matches every method, for requests that no route of their own
@@ -537,7 +607,7 @@ pub fn Router(comptime Ctx: type) type {
         /// own path is not more specific, and registering the second of the
         /// two panics.
         pub fn any(self: *Self, path: []const u8, handler: Handler) void {
-            self.insertRoute(path, null, handler, self.middlewares, null) catch @panic("OOM");
+            self.insertRoute(path, null, handler, self.middlewares, .{}) catch @panic("OOM");
         }
 
         /// Serves the files under `dir` at `prefix`: `GET prefix/a/b.css` is
@@ -558,9 +628,9 @@ pub fn Router(comptime Ctx: type) type {
             if (opts.cache_control) |cc| files.options.cache_control = alloc.dupe(u8, cc) catch @panic("OOM");
             const base = std.mem.trimEnd(u8, prefix, "/");
             // The directory itself, for its index.
-            self.insertRoute(if (base.len == 0) "/" else base, .get, staticAction, middlewares, files) catch @panic("OOM");
+            self.insertRoute(if (base.len == 0) "/" else base, .get, staticAction, middlewares, .{ .data = files }) catch @panic("OOM");
             const files_path = std.fmt.allocPrint(alloc, "{s}/*" ++ Static.param, .{base}) catch @panic("OOM");
-            self.insertRoute(files_path, .get, staticAction, middlewares, files) catch @panic("OOM");
+            self.insertRoute(files_path, .get, staticAction, middlewares, .{ .data = files }) catch @panic("OOM");
         }
 
         /// Serves `data` at `path`, usually a file embedded with
@@ -575,7 +645,7 @@ pub fn Router(comptime Ctx: type) type {
             const alloc = self.arena.allocator();
             const file = alloc.create(Embedded) catch @panic("OOM");
             file.* = Embedded.init(alloc, path, data, opts) catch @panic("OOM");
-            self.insertRoute(path, .get, plainAction(Embedded.handle), middlewares, file) catch @panic("OOM");
+            self.insertRoute(path, .get, plainAction(Embedded.handle), middlewares, .{ .data = file }) catch @panic("OOM");
         }
 
         const staticAction = plainAction(Static.handle);
@@ -638,7 +708,13 @@ pub fn Router(comptime Ctx: type) type {
             }
 
             fn register(g: Group, method: ?Method, path: []const u8, handler: Handler) void {
-                g.router.insertRoute(g.concatPath(path), method, handler, g.mergeMiddlewares(), null) catch @panic("OOM");
+                g.addRouteWith(method, path, handler, .{});
+            }
+
+            /// Registers `handler` for `method` (null: every method) under
+            /// the group's prefix and middleware, with `opts`.
+            pub fn addRouteWith(g: Group, method: ?Method, path: []const u8, handler: Handler, opts: RouteOptions) void {
+                g.router.insertRoute(g.concatPath(path), method, handler, g.mergeMiddlewares(), opts) catch @panic("OOM");
             }
 
             pub fn get(g: Group, path: []const u8, handler: Handler) void {
