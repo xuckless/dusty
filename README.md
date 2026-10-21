@@ -1,3 +1,9 @@
+> **Archived (2026-10-20).** This fork's `anole` branch was Anole's HTTP core.
+> It now lives in Anole itself, at
+> [src/http/core](https://github.com/xuckless/anole/tree/main/src/http/core),
+> with attribution to lalinsky/dusty. Nothing new lands here; the upstream
+> project is [lalinsky/dusty](https://github.com/lalinsky/dusty).
+
 Dusty is a HTTP client/server library built on top of Zig's standard library I/O interface (`std.Io`) and [llhttp](https://github.com/nodejs/llhttp) (HTTP parser from NodeJS).
 
 The library was originally written for [zio](https://github.com/lalinsky/zio), and later ported to `std.Io`. It's still recommended to use it with zio's
